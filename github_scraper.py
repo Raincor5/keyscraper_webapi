@@ -38,7 +38,6 @@ def connect_db():
         print(f"Database connection error: {e}")
         return None
 
-# Create Table if Not Exists
 def setup_db():
     conn = connect_db()
     if not conn:
@@ -48,16 +47,17 @@ def setup_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS leaked_keys (
             id SERIAL PRIMARY KEY,
-            repo_url TEXT,
-            file_path TEXT,
-            key_type TEXT,
-            leaked_key TEXT,
+            repo_url TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            key_type TEXT NOT NULL,
+            leaked_key TEXT NOT NULL UNIQUE,  -- Ensure uniqueness
             detected_at TIMESTAMP DEFAULT NOW(),
             notified BOOLEAN DEFAULT FALSE
         );
     """)
     conn.commit()
     conn.close()
+
 
 # GitHub API Search
 def search_github(query, per_page=10):
@@ -102,14 +102,18 @@ def process_results(results):
         leaked_keys = extract_keys(content)
 
         for key_type, leaked_key in leaked_keys:
-            cursor.execute("""
-                INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (leaked_key) DO NOTHING;
-            """, (repo_url, file_path, key_type, leaked_key))
+            try:
+                cursor.execute("""
+                    INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (leaked_key) DO NOTHING;
+                """, (repo_url, file_path, key_type, leaked_key))
+            except psycopg2.Error as e:
+                print(f"Database insertion error: {e}")
 
     conn.commit()
     conn.close()
+
 
 # Main Execution
 def main():
