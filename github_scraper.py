@@ -3,7 +3,6 @@ import re
 import time
 import os
 import psycopg2  # PostgreSQL
-import pymysql  # MySQL
 from dotenv import load_dotenv
 
 # Load Environment Variables
