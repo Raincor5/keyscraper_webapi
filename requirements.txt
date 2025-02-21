@@ -1,6 +1,5 @@
 requests
 psycopg2
 dotenv
-re
 time
 os
