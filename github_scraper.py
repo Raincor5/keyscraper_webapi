@@ -109,7 +109,7 @@ def maybe_sleep_for_rate_limit(response):
         except ValueError:
             pass
 
-def search_github(per_page=100, max_pages=5):
+def search_github(per_page=100, max_pages=1000):
     search_terms = ["OPEN_API_KEY=sk-", "AKIA", "AIza", "sk_live_", "xoxb", "ghp_"]
     all_results = []
     for query in search_terms:
