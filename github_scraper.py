@@ -100,9 +100,11 @@ def process_results(results):
                 """, (repo_url, file_path, "OpenAI", leaked_key))
             except psycopg2.Error as e:
                 print(f"Database insertion error: {e}")
+                conn.rollback()  # Rollback transaction if an error occurs
 
     conn.commit()
     conn.close()
+
 
 # Main Execution
 def main():
