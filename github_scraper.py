@@ -92,7 +92,7 @@ def search_github(per_page=100, max_pages=5):
         while page <= max_pages:
             url = f"https://api.github.com/search/code?q={query}&per_page={per_page}&page={page}"
             try:
-                response = requests.get(url, headers=HEADERS)
+                response = requests.get(url, headers=HEADERS, timeout=10)
                 maybe_sleep_for_rate_limit(response)
                 if response.status_code == 403:
                     time.sleep(60)
@@ -124,7 +124,7 @@ def fetch_raw_content(item):
     if not file_url:
         return None, None
     try:
-        response = requests.get(file_url, headers=HEADERS)
+        response = requests.get(file_url, headers=HEADERS, timeout=10)
         maybe_sleep_for_rate_limit(response)
         if response.status_code != 200:
             return file_url, None
