@@ -2,7 +2,8 @@ requests
 psycopg2
 dotenv
 flask
-celery
+redis>=3.5.3
+celery[redis]
 tenacity
 aiohttp
 asyncpg
