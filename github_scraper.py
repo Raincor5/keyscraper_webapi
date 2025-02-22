@@ -33,7 +33,7 @@ API_PATTERNS = {
     "GitHub Token": r"ghp_[0-9a-zA-Z]{36}",
 }
 
-# Set up logging to print to stdout for Render compatibility
+# Configure logging to stdout for Render or other platforms
 logging.basicConfig(
     level=logging.DEBUG,  # More verbose logging
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -53,36 +53,72 @@ def connect_db():
         return None
 
 def setup_db():
-    """Sets up the leaked_keys table with a UNIQUE constraint on leaked_key."""
+    """
+    Sets up the leaked_keys table without a UNIQUE constraint
+    (we'll handle duplicates manually).
+    """
     conn = connect_db()
     if not conn:
         return
 
     cursor = conn.cursor()
     try:
-        logging.info("⚙️ Setting up database...")
+        logging.info("⚙️ Setting up database (removing UNIQUE constraint)...")
+        # Drop table if you want a fresh start each time (optional):
+        # cursor.execute("DROP TABLE IF EXISTS leaked_keys;")
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS leaked_keys (
                 id SERIAL PRIMARY KEY,
                 repo_url TEXT NOT NULL,
                 file_path TEXT NOT NULL,
                 key_type TEXT NOT NULL,
-                leaked_key TEXT NOT NULL UNIQUE,
+                leaked_key TEXT NOT NULL,
                 detected_at TIMESTAMP DEFAULT NOW(),
                 notified BOOLEAN DEFAULT FALSE
             );
         """)
         conn.commit()
-        logging.info("✅ Database setup complete.")
+        logging.info("✅ Database setup complete (no unique constraint).")
     except Exception as e:
         logging.error(f"❌ Error setting up database: {e}")
         conn.rollback()
     finally:
         conn.close()
 
-def search_github(per_page=100, max_pages=1000):
+def maybe_sleep_for_rate_limit(response):
+    """
+    Parses GitHub rate-limit headers and sleeps if we are dangerously close to the limit.
+    """
+    remaining = response.headers.get("X-RateLimit-Remaining")
+    reset_time = response.headers.get("X-RateLimit-Reset")
+
+    if remaining is not None:
+        try:
+            remaining = int(remaining)
+            if remaining < 5:  # If we have fewer than 5 requests left
+                # Sleep until reset if possible
+                if reset_time:
+                    # Convert reset_time to int, then to seconds from epoch
+                    reset_epoch = int(reset_time)
+                    current_epoch = int(time.time())
+                    sleep_seconds = reset_epoch - current_epoch
+                    # Sleep for at most 2 minutes, or the difference
+                    sleep_seconds = min(sleep_seconds, 120)
+                    if sleep_seconds > 0:
+                        logging.warning(f"⏳ Near rate limit! Sleeping for {sleep_seconds}s until reset.")
+                        time.sleep(sleep_seconds)
+                else:
+                    # fallback: just sleep 60 seconds
+                    logging.warning("⏳ Near rate limit! No reset header. Sleeping 60s.")
+                    time.sleep(60)
+        except ValueError:
+            pass
+
+def search_github(per_page=100, max_pages=100):
     """
     Fetch all pages of results for leaked API keys from GitHub.
+    Uses 'download_url' if available for raw content.
     Adjust 'search_terms' or 'max_pages' for deeper scans.
     """
     search_terms = ["OPEN_API_KEY=sk-", "AKIA", "AIza", "sk_live_", "xoxb", "ghp_"]
@@ -98,8 +134,11 @@ def search_github(per_page=100, max_pages=1000):
                 response = requests.get(url, headers=HEADERS)
                 logging.info(f"🔄 GitHub API Response: {response.status_code}")
 
+                # Check rate limit
+                maybe_sleep_for_rate_limit(response)
+
                 if response.status_code == 403:
-                    logging.warning("⏳ Rate limit hit! Sleeping for 60 seconds...")
+                    logging.warning("⏳ Rate limit hit! Sleeping 60 seconds...")
                     time.sleep(60)
                     continue
 
@@ -120,9 +159,10 @@ def search_github(per_page=100, max_pages=1000):
                 break
 
             page += 1
+            # Sleep 2 seconds to avoid spamming the server
             time.sleep(2)
 
-    logging.info(f"📊 Total results fetched: {len(all_results)}")
+    logging.info(f"📊 Total GitHub search results fetched: {len(all_results)}")
     return all_results
 
 def extract_keys(content):
@@ -136,13 +176,38 @@ def extract_keys(content):
         for match in matches:
             found_keys.append((key_type, match))
             logging.debug(f"🔑 Found {key_type} key: {match[:10]}... (truncated)")
-    logging.info(f"📌 Extracted {len(found_keys)} API keys from this file's content.")
+    logging.info(f"📌 Extracted {len(found_keys)} total API keys from this file's content.")
     return found_keys
+
+def fetch_raw_content(item):
+    """
+    Tries to retrieve the raw file content using 'download_url'.
+    If not available, uses 'html_url' as a fallback (though HTML may be less reliable).
+    """
+    download_url = item.get("download_url")
+    file_url = download_url if download_url else item.get("html_url")
+
+    if not file_url:
+        logging.warning("⚠️ No valid URL found for raw content.")
+        return None, None
+
+    # Return both the actual URL used and the content
+    try:
+        response = requests.get(file_url, headers=HEADERS)
+        maybe_sleep_for_rate_limit(response)
+        if response.status_code != 200:
+            logging.warning(f"⚠️ Failed to fetch raw content: {file_url} (status {response.status_code})")
+            return file_url, None
+        return file_url, response.text
+    except Exception as e:
+        logging.error(f"❌ Error fetching file content from {file_url}: {e}")
+        return file_url, None
 
 def process_results(results):
     """
-    Takes the items from GitHub search, fetches file content,
-    extracts keys, and inserts them into the leaked_keys table.
+    Takes the items from GitHub search, fetches file content (raw if possible),
+    extracts keys, and inserts them into the leaked_keys table
+    AFTER checking for duplicates manually.
     """
     conn = connect_db()
     if not conn:
@@ -156,52 +221,52 @@ def process_results(results):
     for item in results:
         repo_url = item["repository"]["html_url"]
         file_path = item["path"]
-        file_url = item["html_url"]  # GitHub "html_url" often gives the webpage, not raw content.
-                                     # If you need raw content, use "download_url" from another API response.
 
-        logging.info(f"📄 Processing file: {file_url}")
-
-        # Fetch file content
-        try:
-            file_response = requests.get(file_url, headers=HEADERS)
-            if file_response.status_code != 200:
-                logging.warning(f"⚠️ Failed to fetch file content: {file_url} (status: {file_response.status_code})")
-                continue
-
-            content = file_response.text
-        except Exception as e:
-            logging.error(f"❌ Error fetching file content from {file_url}: {e}")
+        # Attempt to fetch raw content
+        actual_url, content = fetch_raw_content(item)
+        if not content:
+            logging.debug(f"ℹ️ No content returned for {actual_url}. Skipping.")
             continue
+
+        logging.info(f"📄 Processing file: {actual_url}")
 
         leaked_keys = extract_keys(content)
         if not leaked_keys:
-            logging.debug(f"ℹ️ No keys found in {file_url}. Moving on.")
+            logging.debug(f"ℹ️ No keys found in {actual_url}. Moving on.")
             continue
 
         for key_type, leaked_key in leaked_keys:
             try:
-                cursor.execute(
-                    """
-                    INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (leaked_key) DO NOTHING
-                    RETURNING id;
-                    """,
-                    (repo_url, file_path, key_type, leaked_key)
-                )
+                # Manual duplicate check: 
+                # We'll treat duplicates as same repo_url + file_path + leaked_key
+                cursor.execute("""
+                    SELECT id
+                    FROM leaked_keys
+                    WHERE repo_url = %s
+                      AND file_path = %s
+                      AND leaked_key = %s
+                """, (repo_url, file_path, leaked_key))
+                existing = cursor.fetchone()
 
-                # If RETURNING id returns a row, it means a new record was inserted
-                inserted_id = cursor.fetchone()
-                if inserted_id:
-                    total_inserted += 1
-                    logging.info(f"✅ Inserted {key_type} key from {file_path} (ID: {inserted_id[0]})")
+                if existing:
+                    logging.info(f"🤔 Key already in DB for {repo_url}, {file_path}. Skipping.")
                 else:
-                    logging.info(f"🤔 Key {leaked_key[:10]}... already exists; skipped insertion.")
+                    cursor.execute(
+                        """
+                        INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key)
+                        VALUES (%s, %s, %s, %s)
+                        RETURNING id;
+                        """,
+                        (repo_url, file_path, key_type, leaked_key)
+                    )
+                    new_id = cursor.fetchone()[0]
+                    total_inserted += 1
+                    logging.info(f"✅ Inserted new {key_type} key (ID: {new_id}) from {file_path}.")
 
             except psycopg2.Error as e:
                 logging.error(f"❌ Database insertion error: {e}")
-                conn.rollback()  # rollback this transaction
-            # else we keep going within this file
+                conn.rollback()
+                continue
 
     # Attempt to commit the entire batch
     try:
