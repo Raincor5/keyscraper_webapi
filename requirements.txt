@@ -2,3 +2,5 @@ requests
 psycopg2
 dotenv
 flask
+celery
+tenacity

@@ -1,32 +1,48 @@
-from flask import Flask
-import requests
+import asyncio
+import aiohttp
+import asyncpg
+import os
 import re
 import time
-import os
-import psycopg2
-from psycopg2.pool import ThreadedConnectionPool
-from dotenv import load_dotenv
-import sys
-from threading import Thread, Lock
-import concurrent.futures
+import logging
+from datetime import datetime
+from tenacity import retry, wait_exponential, stop_after_attempt
+from celery import Celery
+from flask import Flask
 
-# Load environment variables
-load_dotenv()
+# --- Configuration Management ---
+# These settings are loaded from environment variables.
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+# Build a DSN for Postgres; you can also supply a complete DATABASE_URL
+DB_DSN = os.environ.get("DATABASE_URL") or (
+    f"postgresql://{os.environ.get('DB_USER')}:{os.environ.get('DB_PASSWORD')}"
+    f"@{os.environ.get('DB_HOST')}:{os.environ.get('DB_PORT', '5432')}/{os.environ.get('DB_NAME')}"
+)
+# Broker URL for Celery (e.g. Redis)
+BROKER_URL = os.environ.get("BROKER_URL", "redis://localhost:6379/0")
+# HTTP timeout in seconds
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
+# Maximum pages to scan per search term
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
+# --- End Configuration ---
 
-# GitHub API Credentials
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"}
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+# --- End Logging Setup ---
 
-# Database Configuration
-DB_CONFIG = {
-    "dbname": os.getenv("DB_NAME"),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "host": os.getenv("DB_HOST"),
-    "port": os.getenv("DB_PORT", "5432"),
-}
+# --- Celery Setup ---
+celery = Celery("scan_tasks", broker=BROKER_URL)
+# --- End Celery Setup ---
 
-# API Key Patterns (precompiled)
+# --- Flask App Setup ---
+flask_app = Flask(__name__)
+# --- End Flask App Setup ---
+
+# --- Precompile API Key Patterns ---
 API_PATTERNS = {
     "OpenAI": r"OPEN_API_KEY=sk-[a-zA-Z0-9]{48}",
     "AWS": r"AKIA[0-9A-Z]{16}",
@@ -36,183 +52,175 @@ API_PATTERNS = {
     "GitHub Token": r"ghp_[0-9a-zA-Z]{36}",
 }
 COMPILED_PATTERNS = {k: re.compile(v) for k, v in API_PATTERNS.items()}
+# --- End Patterns ---
 
-# Global lock for unique count (if needed)
-unique_lock = Lock()
+# --- Database Table Setup Functions ---
+async def setup_db(pool):
+    async with pool.acquire() as conn:
+        # Create table to store keys.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS leaked_keys (
+                id SERIAL PRIMARY KEY,
+                repo_url TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                key_type TEXT NOT NULL,
+                leaked_key TEXT NOT NULL,
+                detected_at TIMESTAMP DEFAULT NOW(),
+                notified BOOLEAN DEFAULT FALSE
+            );
+        """)
+        # Create table to cache the last scan timestamp.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS scan_cache (
+                id SERIAL PRIMARY KEY,
+                last_scanned TIMESTAMP
+            );
+        """)
+    logger.info("Database setup complete.")
 
-def flush_print(*args, **kwargs):
-    print(*args, **kwargs)
-    sys.stdout.flush()
+async def get_last_scanned(pool):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT last_scanned FROM scan_cache ORDER BY id DESC LIMIT 1;")
+        return row["last_scanned"] if row else None
 
-def setup_db():
-    try:
-        with psycopg2.connect(**DB_CONFIG) as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS leaked_keys (
-                        id SERIAL PRIMARY KEY,
-                        repo_url TEXT NOT NULL,
-                        file_path TEXT NOT NULL,
-                        key_type TEXT NOT NULL,
-                        leaked_key TEXT NOT NULL,
-                        detected_at TIMESTAMP DEFAULT NOW(),
-                        notified BOOLEAN DEFAULT FALSE
-                    );
-                """)
-                conn.commit()
-                flush_print("Database setup complete.")
-    except Exception as e:
-        flush_print(f"Error setting up database: {e}")
+async def update_last_scanned(pool, timestamp):
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO scan_cache (last_scanned) VALUES ($1);", timestamp)
+# --- End DB Setup Functions ---
 
-def maybe_sleep_for_rate_limit(response):
-    remaining = response.headers.get("X-RateLimit-Remaining")
-    reset_time = response.headers.get("X-RateLimit-Reset")
-    if remaining is not None:
-        try:
-            remaining = int(remaining)
-            if remaining < 5:
-                if reset_time:
-                    reset_epoch = int(reset_time)
-                    current_epoch = int(time.time())
-                    sleep_seconds = min(reset_epoch - current_epoch, 120)
-                    if sleep_seconds > 0:
-                        flush_print(f"Near rate limit! Sleeping for {sleep_seconds}s.")
-                        time.sleep(sleep_seconds)
-                else:
-                    flush_print("Near rate limit! Sleeping for 60s.")
-                    time.sleep(60)
-        except ValueError:
-            pass
+# --- HTTP Helpers with Retry & Rate Limit Handling ---
+@retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
+async def fetch_github(url):
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers, timeout=HTTP_TIMEOUT) as response:
+            # If rate limited, sleep and let tenacity retry.
+            if response.status == 403:
+                logger.warning("Rate limited by GitHub, sleeping for 60 seconds...")
+                await asyncio.sleep(60)
+                raise Exception("Rate limited")
+            if response.status != 200:
+                text = await response.text()
+                raise Exception(f"GitHub API error {response.status}: {text}")
+            return await response.json()
 
-def search_github(per_page=100, max_pages=5):
+@retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
+async def fetch_file_content(url):
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers, timeout=HTTP_TIMEOUT) as response:
+            if response.status == 403:
+                logger.warning("Rate limited when fetching file, sleeping for 60 seconds...")
+                await asyncio.sleep(60)
+                raise Exception("Rate limited on file fetch")
+            if response.status != 200:
+                raise Exception(f"Error fetching file content {response.status}")
+            return await response.text()
+# --- End HTTP Helpers ---
+
+# --- GitHub Search & Processing ---
+async def search_github(pool, per_page=100, max_pages=MAX_PAGES):
     search_terms = ["OPEN_API_KEY=sk-", "AKIA", "AIza", "sk_live_", "xoxb", "ghp_"]
-    all_results = []
-    for query in search_terms:
-        page = 1
-        while page <= max_pages:
+    results = []
+    # Retrieve last scanned timestamp for incremental scanning
+    last_scanned = await get_last_scanned(pool)
+    filter_str = ""
+    if last_scanned:
+        # GitHub search qualifier to filter by push date (ISO 8601)
+        filter_str = f" pushed:>{last_scanned.isoformat()}"
+    for term in search_terms:
+        for page in range(1, max_pages + 1):
+            query = term + filter_str
             url = f"https://api.github.com/search/code?q={query}&per_page={per_page}&page={page}"
             try:
-                response = requests.get(url, headers=HEADERS, timeout=10)
-                maybe_sleep_for_rate_limit(response)
-                if response.status_code == 403:
-                    time.sleep(60)
-                    continue
-                if response.status_code != 200:
-                    break
-                items = response.json().get("items", [])
+                data = await fetch_github(url)
+                items = data.get("items", [])
                 if not items:
                     break
-                all_results.extend(items)
+                results.extend(items)
             except Exception as e:
-                flush_print(f"GitHub API request failed: {e}")
+                logger.error(f"Error fetching GitHub items: {e}")
                 break
-            page += 1
-            time.sleep(2)
-    return all_results
+            await asyncio.sleep(2)  # slight delay to avoid spamming
+    return results
 
-def extract_keys(content):
-    found_keys = []
-    for key_type, compiled in COMPILED_PATTERNS.items():
-        matches = compiled.findall(content)
-        for match in matches:
-            found_keys.append((key_type, match))
-    return found_keys
-
-def fetch_raw_content(item):
+async def process_item(item, pool):
+    repo_url = item["repository"]["html_url"]
+    file_path = item["path"]
+    logger.info(f"Processing file: {repo_url}/{file_path}")
     download_url = item.get("download_url")
     file_url = download_url if download_url else item.get("html_url")
     if not file_url:
-        return None, None
-    try:
-        response = requests.get(file_url, headers=HEADERS, timeout=10)
-        maybe_sleep_for_rate_limit(response)
-        if response.status_code != 200:
-            return file_url, None
-        return file_url, response.text
-    except Exception as e:
-        flush_print(f"Error fetching file content from {file_url}: {e}")
-        return file_url, None
-
-def process_item(item, pool):
-    try:
-        repo_url = item["repository"]["html_url"]
-        file_path = item["path"]
-        flush_print(f"Processing file: {repo_url}/{file_path}")
-        actual_url, content = fetch_raw_content(item)
-        if not content:
-            flush_print(f"Failed to fetch content for {actual_url}")
-            return 0
-
-        leaked_keys = extract_keys(content)
-        if not leaked_keys:
-            flush_print(f"No keys found in {actual_url}")
-            return 0
-
-        unique_in_item = 0
-        conn = pool.getconn()
-        try:
-            with conn.cursor() as cursor:
-                for key_type, leaked_key in leaked_keys:
-                    cursor.execute("""
-                        SELECT id FROM leaked_keys
-                        WHERE repo_url = %s AND file_path = %s AND leaked_key = %s
-                    """, (repo_url, file_path, leaked_key))
-                    if cursor.fetchone():
-                        flush_print(f"Key already exists for {repo_url}/{file_path}")
-                        continue
-
-                    cursor.execute("""
-                        INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key)
-                        VALUES (%s, %s, %s, %s)
-                        RETURNING id;
-                    """, (repo_url, file_path, key_type, leaked_key))
-                    new_id = cursor.fetchone()[0]
-                    conn.commit()
-                    unique_in_item += 1
-                    flush_print(f"Unique key: {leaked_key[:10]}... | Inserted ID: {new_id}")
-            return unique_in_item
-        except Exception as e:
-            flush_print(f"Database error for {repo_url}/{file_path}: {e}")
-            conn.rollback()
-            return 0
-        finally:
-            pool.putconn(conn)
-    except Exception as e:
-        flush_print(f"Error processing item: {e}")
+        logger.info(f"No file URL for {repo_url}/{file_path}")
         return 0
+    try:
+        content = await fetch_file_content(file_url)
+    except Exception as e:
+        logger.error(f"Error fetching file {file_url}: {e}")
+        return 0
+    leaked_keys = []
+    for key_type, compiled in COMPILED_PATTERNS.items():
+        matches = compiled.findall(content)
+        for match in matches:
+            leaked_keys.append((key_type, match))
+    if not leaked_keys:
+        logger.info(f"No keys found in {file_url}")
+        return 0
+    unique_count = 0
+    async with pool.acquire() as conn:
+        for key_type, leaked_key in leaked_keys:
+            row = await conn.fetchrow(
+                "SELECT id FROM leaked_keys WHERE repo_url=$1 AND file_path=$2 AND leaked_key=$3",
+                repo_url, file_path, leaked_key
+            )
+            if row:
+                logger.info(f"Key already exists for {repo_url}/{file_path}")
+                continue
+            row = await conn.fetchrow(
+                "INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key) VALUES ($1, $2, $3, $4) RETURNING id",
+                repo_url, file_path, key_type, leaked_key
+            )
+            unique_count += 1
+            logger.info(f"Unique key: {leaked_key[:10]}... | Inserted ID: {row['id']}")
+    return unique_count
 
-def run_scan():
-    flush_print("Starting scan...")
-    setup_db()
-    results = search_github()
-    flush_print(f"Fetched {len(results)} GitHub results.")
+async def run_async_scan():
+    logger.info("Starting async scan...")
+    # Create a connection pool
+    pool = await asyncpg.create_pool(dsn=DB_DSN)
+    await setup_db(pool)
+    results = await search_github(pool)
+    logger.info(f"Fetched {len(results)} GitHub results.")
     if not results:
-        flush_print("No results returned from GitHub API.")
-        flush_print("Scan complete.")
+        logger.info("No new results. Scan complete.")
+        await update_last_scanned(pool, datetime.utcnow())
+        await pool.close()
         return
-
-    pool = ThreadedConnectionPool(1, 10, **DB_CONFIG)
     total_unique = 0
+    tasks = [process_item(item, pool) for item in results]
+    counts = await asyncio.gather(*tasks, return_exceptions=True)
+    for count in counts:
+        if isinstance(count, Exception):
+            logger.error(f"Error in processing task: {count}")
+        else:
+            total_unique += count
+    logger.info(f"Scan complete. Total unique keys saved: {total_unique}")
+    await update_last_scanned(pool, datetime.utcnow())
+    await pool.close()
+# --- End GitHub Processing ---
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(process_item, item, pool) for item in results]
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                count = future.result()
-                total_unique += count
-            except Exception as e:
-                flush_print(f"Error in worker thread: {e}")
+# --- Celery Task ---
+@celery.task
+def celery_run_scan():
+    asyncio.run(run_async_scan())
+# --- End Celery Task ---
 
-    pool.closeall()
-    flush_print(f"Scan complete. Total unique keys saved: {total_unique}")
+# --- Flask Endpoint ---
+@flask_app.route("/", methods=["GET"])
+def index():
+    celery_run_scan.delay()
+    return "Async scan started. Check logs for output.\n"
+# --- End Flask Endpoint ---
 
-app = Flask(__name__)
-
-# The /scan endpoint starts the scan in a background thread and returns a simple message.
-@app.route('/', methods=['GET'])
-def scan():
-    Thread(target=run_scan).start()
-    return "Scan started. Check the Render logs for output.\n", 200
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
+if __name__ == "__main__":
+    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
