@@ -41,7 +41,7 @@ def connect_db():
     except Exception as e:
         logging.error(f"Database connection error: {e}")
         return None
-
+        
 def setup_db():
     conn = connect_db()
     if not conn:
@@ -61,12 +61,13 @@ def setup_db():
             );
         """)
         conn.commit()
-        logging.info("Database setup completed.")
+        logging.info("Database setup completed with UNIQUE constraint on leaked_key.")
     except Exception as e:
         logging.error(f"Error setting up database: {e}")
         conn.rollback()
     finally:
         conn.close()
+
 
 # GitHub API Search for OpenAI Keys
 def search_github(per_page=100, max_pages=10):
