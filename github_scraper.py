@@ -209,7 +209,7 @@ def run_scan():
 app = Flask(__name__)
 
 # The /scan endpoint starts the scan in a background thread and returns a simple message.
-@app.route('/scan', methods=['GET'])
+@app.route('/', methods=['GET'])
 def scan():
     Thread(target=run_scan).start()
     return "Scan started. Check the Render logs for output.\n", 200
