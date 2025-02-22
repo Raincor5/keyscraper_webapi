@@ -41,7 +41,7 @@ def connect_db():
     except Exception as e:
         logging.error(f"Database connection error: {e}")
         return None
-        
+
 def setup_db():
     conn = connect_db()
     if not conn:
@@ -70,7 +70,7 @@ def setup_db():
 
 
 # GitHub API Search for OpenAI Keys
-def search_github(per_page=100, max_pages=10):
+def search_github(per_page=1000, max_pages=100):
     """Fetch all pages of results for OpenAI API key leaks from GitHub."""
     query = "OPEN_API_KEY=sk-"
     page = 1
