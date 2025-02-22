@@ -35,17 +35,15 @@ API_PATTERNS = {
 
 # Set up logging to print to stdout for Render compatibility
 logging.basicConfig(
-    level=logging.DEBUG,  # Change to INFO or ERROR in production
+    level=logging.DEBUG,  # More verbose logging
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout)  # Logs to stdout for Render
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
 logging.info("🔍 Script started: Searching for leaked API keys.")
 
-# Connect to Database
 def connect_db():
+    """Connects to PostgreSQL and returns the connection."""
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         logging.info("✅ Connected to the database successfully.")
@@ -55,6 +53,7 @@ def connect_db():
         return None
 
 def setup_db():
+    """Sets up the leaked_keys table with a UNIQUE constraint on leaked_key."""
     conn = connect_db()
     if not conn:
         return
@@ -81,9 +80,11 @@ def setup_db():
     finally:
         conn.close()
 
-# GitHub API Search for API Keys
-def search_github(per_page=100, max_pages=10):
-    """Fetch all pages of results for leaked API keys from GitHub."""
+def search_github(per_page=100, max_pages=1000):
+    """
+    Fetch all pages of results for leaked API keys from GitHub.
+    Adjust 'search_terms' or 'max_pages' for deeper scans.
+    """
     search_terms = ["OPEN_API_KEY=sk-", "AKIA", "AIza", "sk_live_", "xoxb", "ghp_"]
     all_results = []
 
@@ -100,94 +101,118 @@ def search_github(per_page=100, max_pages=10):
                 if response.status_code == 403:
                     logging.warning("⏳ Rate limit hit! Sleeping for 60 seconds...")
                     time.sleep(60)
-                    continue  
+                    continue
 
                 if response.status_code != 200:
                     logging.error(f"❌ GitHub API Error: {response.status_code} - {response.text}")
-                    break  
+                    break
 
                 items = response.json().get("items", [])
                 if not items:
                     logging.info(f"✅ No more results for '{query}' on Page {page}. Stopping.")
-                    break  
+                    break
 
                 all_results.extend(items)
                 logging.info(f"✅ Fetched {len(items)} results from '{query}' on Page {page}.")
 
             except Exception as e:
                 logging.error(f"❌ GitHub API request failed: {e}")
-                break  
+                break
 
             page += 1
-            time.sleep(2)  
+            time.sleep(2)
 
     logging.info(f"📊 Total results fetched: {len(all_results)}")
     return all_results
 
-# Extract API Keys from Code
 def extract_keys(content):
+    """
+    Applies each regex in API_PATTERNS to the file content
+    and returns a list of (key_type, key_value) for all matches.
+    """
     found_keys = []
     for key_type, pattern in API_PATTERNS.items():
         matches = re.findall(pattern, content)
         for match in matches:
             found_keys.append((key_type, match))
-            logging.debug(f"🔑 Found {key_type} key: {match[:10]}...")  
-
-    logging.info(f"📌 Extracted {len(found_keys)} API keys from content.")
+            logging.debug(f"🔑 Found {key_type} key: {match[:10]}... (truncated)")
+    logging.info(f"📌 Extracted {len(found_keys)} API keys from this file's content.")
     return found_keys
 
-# Process Results & Store in DB
 def process_results(results):
+    """
+    Takes the items from GitHub search, fetches file content,
+    extracts keys, and inserts them into the leaked_keys table.
+    """
     conn = connect_db()
     if not conn:
+        logging.error("❌ Database connection failed. Cannot process results.")
         return
 
     cursor = conn.cursor()
 
+    total_inserted = 0  # Track how many new records we insert
+
     for item in results:
         repo_url = item["repository"]["html_url"]
         file_path = item["path"]
-        file_url = item["html_url"]
+        file_url = item["html_url"]  # GitHub "html_url" often gives the webpage, not raw content.
+                                     # If you need raw content, use "download_url" from another API response.
 
         logging.info(f"📄 Processing file: {file_url}")
 
+        # Fetch file content
         try:
             file_response = requests.get(file_url, headers=HEADERS)
             if file_response.status_code != 200:
-                logging.warning(f"⚠️ Failed to fetch file content: {file_url}")
+                logging.warning(f"⚠️ Failed to fetch file content: {file_url} (status: {file_response.status_code})")
                 continue
 
             content = file_response.text
         except Exception as e:
-            logging.error(f"❌ Error fetching file content: {e}")
+            logging.error(f"❌ Error fetching file content from {file_url}: {e}")
             continue
 
         leaked_keys = extract_keys(content)
+        if not leaked_keys:
+            logging.debug(f"ℹ️ No keys found in {file_url}. Moving on.")
+            continue
 
         for key_type, leaked_key in leaked_keys:
             try:
-                cursor.execute("""
+                cursor.execute(
+                    """
                     INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key)
                     VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (leaked_key) DO NOTHING;
-                """, (repo_url, file_path, key_type, leaked_key))
+                    ON CONFLICT (leaked_key) DO NOTHING
+                    RETURNING id;
+                    """,
+                    (repo_url, file_path, key_type, leaked_key)
+                )
 
-                logging.info(f"✅ Stored {key_type} key from {file_path} into database.")
+                # If RETURNING id returns a row, it means a new record was inserted
+                inserted_id = cursor.fetchone()
+                if inserted_id:
+                    total_inserted += 1
+                    logging.info(f"✅ Inserted {key_type} key from {file_path} (ID: {inserted_id[0]})")
+                else:
+                    logging.info(f"🤔 Key {leaked_key[:10]}... already exists; skipped insertion.")
 
             except psycopg2.Error as e:
                 logging.error(f"❌ Database insertion error: {e}")
-                conn.rollback()
+                conn.rollback()  # rollback this transaction
+            # else we keep going within this file
 
+    # Attempt to commit the entire batch
     try:
         conn.commit()
-        logging.info("✅ Database transaction committed successfully.")
+        logging.info(f"✅ Database transaction committed. {total_inserted} new records inserted in total.")
     except Exception as e:
         logging.error(f"❌ Error committing transaction: {e}")
         conn.rollback()
     finally:
         conn.close()
 
-# Main Execution
 def main():
     logging.info("🚀 Starting API key scanning process...")
     setup_db()
@@ -196,7 +221,7 @@ def main():
     if results:
         process_results(results)
     else:
-        logging.info("ℹ️ No API keys found in the search.")
+        logging.info("ℹ️ No items returned from the GitHub API search.")
 
     logging.info("🏁 Execution complete.")
 
