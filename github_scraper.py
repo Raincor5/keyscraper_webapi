@@ -70,7 +70,7 @@ def setup_db():
 
 
 # GitHub API Search for OpenAI Keys
-def search_github(per_page=1000, max_pages=100):
+def search_github(per_page=100, max_pages=1000):
     """Fetch all pages of results for OpenAI API key leaks from GitHub."""
     query = "OPEN_API_KEY=sk-"
     page = 1
