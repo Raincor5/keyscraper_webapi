@@ -22,7 +22,7 @@ DB_CONFIG = {
 }
 
 # Regex Pattern for OpenAI API Keys
-OPENAI_API_PATTERN = r"sk-[a-zA-Z0-9]{48}"
+OPENAI_API_PATTERN = r"OPENAI_API_KEY=sk-[a-zA-Z0-9]{48}"
 
 # Connect to Database
 def connect_db():
