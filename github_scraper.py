@@ -152,15 +152,14 @@ def scan():
         yield "Setting up database...\n"
         setup_db()
         yield "Database setup complete.\n"
-
+        
         yield "Searching GitHub...\n"
         results = search_github()
         yield f"Fetched {len(results)} GitHub results.\n"
-
         if not results:
             yield "No results returned from GitHub API.\n"
             return
-
+        
         conn = connect_db()
         if not conn:
             yield "Database connection error. Scan aborted.\n"
@@ -205,7 +204,7 @@ def scan():
                         unique_count += 1
                         yield f"Unique key: {leaked_key[:10]}... | Count: {unique_count}\n"
                 except Exception as e:
-                    yield f"Database insertion error for key from {repo_url}/{file_path}: {e}\n"
+                    yield f"Database insertion error for {repo_url}/{file_path}: {e}\n"
                     conn.rollback()
                     continue
 
@@ -220,7 +219,13 @@ def scan():
 
         yield "Scan complete.\n"
 
-    return Response(generate(), mimetype="text/plain")
+    # Set headers to disable buffering for a live tail effect
+    headers = {
+        "Content-Type": "text/plain",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no"
+    }
+    return Response(generate(), headers=headers)
 
 if __name__ == '__main__':
     # Bind to the appropriate port for Render or default to 5000
