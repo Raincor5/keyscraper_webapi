@@ -22,8 +22,15 @@ DB_CONFIG = {
     "port": os.getenv("DB_PORT", "5432"),  # Default to PostgreSQL port
 }
 
-# Regex Pattern for OpenAI API Keys (with "OPEN_API_KEY=" prefix)
-OPENAI_API_PATTERN = r"OPEN_API_KEY=sk-[a-zA-Z0-9]{48}"
+# API Key Patterns
+API_PATTERNS = {
+    "OpenAI": r"OPEN_API_KEY=sk-[a-zA-Z0-9]{48}",
+    "AWS": r"AKIA[0-9A-Z]{16}",
+    "Google API": r"AIza[0-9A-Za-z-_]{35}",
+    "Stripe": r"sk_live_[0-9a-zA-Z]{24}",
+    "Slack": r"xox[baprs]-[0-9A-Za-z]{10,48}",
+    "GitHub Token": r"ghp_[0-9a-zA-Z]{36}",
+}
 
 # Set up logging
 logging.basicConfig(
@@ -68,53 +75,56 @@ def setup_db():
     finally:
         conn.close()
 
-
-# GitHub API Search for OpenAI Keys
-def search_github(per_page=100, max_pages=1000):
-    """Fetch all pages of results for OpenAI API key leaks from GitHub."""
-    query = "OPEN_API_KEY=sk-"
-    page = 1
+# GitHub API Search for API Keys
+def search_github(per_page=100, max_pages=10):
+    """Fetch all pages of results for leaked API keys from GitHub."""
+    search_terms = ["OPEN_API_KEY=sk-", "AKIA", "AIza", "sk_live_", "xoxb", "ghp_"]
     all_results = []
 
-    while page <= max_pages:
-        url = f"https://api.github.com/search/code?q={query}&per_page={per_page}&page={page}"
-        logging.info(f"Fetching page {page}...")
+    for query in search_terms:
+        page = 1
+        while page <= max_pages:
+            url = f"https://api.github.com/search/code?q={query}&per_page={per_page}&page={page}"
+            logging.info(f"Fetching page {page} for query: {query}")
 
-        try:
-            response = requests.get(url, headers=HEADERS)
-            
-            if response.status_code == 403:  # Rate limit handling
-                logging.warning("Rate limited! Sleeping for 60 seconds...")
-                time.sleep(60)
-                continue  # Retry the same page after sleeping
+            try:
+                response = requests.get(url, headers=HEADERS)
+                
+                if response.status_code == 403:  # Rate limit handling
+                    logging.warning("Rate limited! Sleeping for 60 seconds...")
+                    time.sleep(60)
+                    continue  # Retry the same page after sleeping
 
-            if response.status_code != 200:
-                logging.error(f"GitHub API Error: {response.status_code} - {response.text}")
-                break  # Stop fetching if there's an error
+                if response.status_code != 200:
+                    logging.error(f"GitHub API Error: {response.status_code} - {response.text}")
+                    break  # Stop fetching if there's an error
 
-            items = response.json().get("items", [])
-            if not items:
-                logging.info(f"No more results found on page {page}. Stopping.")
-                break  # Stop if GitHub returns no more results
+                items = response.json().get("items", [])
+                if not items:
+                    logging.info(f"No more results found for {query} on page {page}. Stopping.")
+                    break  # Stop if GitHub returns no more results
 
-            all_results.extend(items)
-            logging.info(f"Fetched {len(items)} results from page {page}.")
+                all_results.extend(items)
+                logging.info(f"Fetched {len(items)} results from page {page} for {query}.")
 
-        except Exception as e:
-            logging.error(f"GitHub API request failed: {e}")
-            break  # Stop on critical failure
+            except Exception as e:
+                logging.error(f"GitHub API request failed: {e}")
+                break  # Stop on critical failure
 
-        page += 1
-        time.sleep(2)  # Delay to avoid hitting rate limits
+            page += 1
+            time.sleep(2)  # Delay to avoid hitting rate limits
 
     logging.info(f"Total results fetched: {len(all_results)}")
     return all_results
 
-
-# Extract OpenAI API Keys from Code
+# Extract API Keys from Code
 def extract_keys(content):
-    found_keys = re.findall(OPENAI_API_PATTERN, content)
-    logging.info(f"Extracted {len(found_keys)} OpenAI API keys from content.")
+    found_keys = []
+    for key_type, pattern in API_PATTERNS.items():
+        matches = re.findall(pattern, content)
+        for match in matches:
+            found_keys.append((key_type, match))
+    logging.info(f"Extracted {len(found_keys)} API keys from content.")
     return found_keys
 
 # Process Results & Store in DB
@@ -146,15 +156,15 @@ def process_results(results):
 
         leaked_keys = extract_keys(content)
 
-        for leaked_key in leaked_keys:
+        for key_type, leaked_key in leaked_keys:
             try:
                 cursor.execute("""
                     INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key)
                     VALUES (%s, %s, %s, %s)
                     ON CONFLICT (leaked_key) DO NOTHING;
-                """, (repo_url, file_path, "OpenAI", leaked_key))
+                """, (repo_url, file_path, key_type, leaked_key))
 
-                logging.info(f"Inserted key {leaked_key} from {file_path} into database.")
+                logging.info(f"Inserted {key_type} key from {file_path} into database.")
 
             except psycopg2.Error as e:
                 logging.error(f"Database insertion error: {e}")
@@ -172,7 +182,7 @@ def process_results(results):
 # Main Execution
 def main():
     setup_db()
-    logging.info("Starting search for OpenAI API keys...")
+    logging.info("Starting search for API keys...")
 
     results = search_github()
     if results:
