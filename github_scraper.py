@@ -1,14 +1,12 @@
-from flask import Flask, Response
+from flask import Flask
 import requests
 import re
 import time
 import os
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
-import logging
 from dotenv import load_dotenv
 import sys
-import queue
 from threading import Thread, Lock
 import concurrent.futures
 
@@ -39,37 +37,14 @@ API_PATTERNS = {
 }
 COMPILED_PATTERNS = {k: re.compile(v) for k, v in API_PATTERNS.items()}
 
-# Configure logging to stdout
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-
-# Create a queue to capture log messages for streaming
-log_queue = queue.Queue()
-
-class QueueHandler(logging.Handler):
-    def __init__(self, q):
-        super().__init__()
-        self.queue = q
-
-    def emit(self, record):
-        log_entry = self.format(record)
-        self.queue.put(log_entry)
-
-queue_handler = QueueHandler(log_queue)
-queue_handler.setLevel(logging.INFO)
-queue_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-logging.getLogger().addHandler(queue_handler)
-
-app = Flask(__name__)
-
-# Global lock for logging unique count (optional)
+# Global lock for unique count (if needed)
 unique_lock = Lock()
 
+def flush_print(*args, **kwargs):
+    print(*args, **kwargs)
+    sys.stdout.flush()
+
 def setup_db():
-    # Use a temporary connection to set up the table
     try:
         with psycopg2.connect(**DB_CONFIG) as conn:
             with conn.cursor() as cursor:
@@ -85,9 +60,9 @@ def setup_db():
                     );
                 """)
                 conn.commit()
-                logging.info("Database setup complete.")
+                flush_print("Database setup complete.")
     except Exception as e:
-        logging.error(f"Error setting up database: {e}")
+        flush_print(f"Error setting up database: {e}")
 
 def maybe_sleep_for_rate_limit(response):
     remaining = response.headers.get("X-RateLimit-Remaining")
@@ -101,15 +76,15 @@ def maybe_sleep_for_rate_limit(response):
                     current_epoch = int(time.time())
                     sleep_seconds = min(reset_epoch - current_epoch, 120)
                     if sleep_seconds > 0:
-                        logging.warning(f"Near rate limit! Sleeping for {sleep_seconds}s.")
+                        flush_print(f"Near rate limit! Sleeping for {sleep_seconds}s.")
                         time.sleep(sleep_seconds)
                 else:
-                    logging.warning("Near rate limit! Sleeping for 60s.")
+                    flush_print("Near rate limit! Sleeping for 60s.")
                     time.sleep(60)
         except ValueError:
             pass
 
-def search_github(per_page=100, max_pages=1000):
+def search_github(per_page=100, max_pages=5):
     search_terms = ["OPEN_API_KEY=sk-", "AKIA", "AIza", "sk_live_", "xoxb", "ghp_"]
     all_results = []
     for query in search_terms:
@@ -129,7 +104,7 @@ def search_github(per_page=100, max_pages=1000):
                     break
                 all_results.extend(items)
             except Exception as e:
-                logging.error(f"GitHub API request failed: {e}")
+                flush_print(f"GitHub API request failed: {e}")
                 break
             page += 1
             time.sleep(2)
@@ -155,25 +130,22 @@ def fetch_raw_content(item):
             return file_url, None
         return file_url, response.text
     except Exception as e:
-        logging.error(f"Error fetching file content from {file_url}: {e}")
+        flush_print(f"Error fetching file content from {file_url}: {e}")
         return file_url, None
 
 def process_item(item, pool):
-    """Process a single GitHub item: fetch content, extract keys, and insert unique keys into the DB.
-       Returns the number of new unique keys inserted.
-    """
     try:
         repo_url = item["repository"]["html_url"]
         file_path = item["path"]
-        logging.info(f"Processing file: {repo_url}/{file_path}")
+        flush_print(f"Processing file: {repo_url}/{file_path}")
         actual_url, content = fetch_raw_content(item)
         if not content:
-            logging.info(f"Failed to fetch content for {actual_url}")
+            flush_print(f"Failed to fetch content for {actual_url}")
             return 0
 
         leaked_keys = extract_keys(content)
         if not leaked_keys:
-            logging.info(f"No keys found in {actual_url}")
+            flush_print(f"No keys found in {actual_url}")
             return 0
 
         unique_in_item = 0
@@ -181,13 +153,12 @@ def process_item(item, pool):
         try:
             with conn.cursor() as cursor:
                 for key_type, leaked_key in leaked_keys:
-                    # Check for duplicate entry
                     cursor.execute("""
                         SELECT id FROM leaked_keys
                         WHERE repo_url = %s AND file_path = %s AND leaked_key = %s
                     """, (repo_url, file_path, leaked_key))
                     if cursor.fetchone():
-                        logging.info(f"Key already exists for {repo_url}/{file_path}")
+                        flush_print(f"Key already exists for {repo_url}/{file_path}")
                         continue
 
                     cursor.execute("""
@@ -197,35 +168,32 @@ def process_item(item, pool):
                     """, (repo_url, file_path, key_type, leaked_key))
                     new_id = cursor.fetchone()[0]
                     conn.commit()
-                    with unique_lock:
-                        unique_in_item += 1
-                    logging.info(f"Unique key: {leaked_key[:10]}... | Inserted ID: {new_id}")
+                    unique_in_item += 1
+                    flush_print(f"Unique key: {leaked_key[:10]}... | Inserted ID: {new_id}")
             return unique_in_item
         except Exception as e:
-            logging.error(f"Database error for {repo_url}/{file_path}: {e}")
+            flush_print(f"Database error for {repo_url}/{file_path}: {e}")
             conn.rollback()
             return 0
         finally:
             pool.putconn(conn)
     except Exception as e:
-        logging.error(f"Error processing item: {e}")
+        flush_print(f"Error processing item: {e}")
         return 0
 
 def run_scan():
-    logging.info("Starting scan...")
+    flush_print("Starting scan...")
     setup_db()
     results = search_github()
-    logging.info(f"Fetched {len(results)} GitHub results.")
+    flush_print(f"Fetched {len(results)} GitHub results.")
     if not results:
-        logging.info("No results returned from GitHub API.")
-        logging.info("Scan complete.")
+        flush_print("No results returned from GitHub API.")
+        flush_print("Scan complete.")
         return
 
-    # Create a threaded connection pool
     pool = ThreadedConnectionPool(1, 10, **DB_CONFIG)
     total_unique = 0
 
-    # Process GitHub items concurrently
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(process_item, item, pool) for item in results]
         for future in concurrent.futures.as_completed(futures):
@@ -233,33 +201,18 @@ def run_scan():
                 count = future.result()
                 total_unique += count
             except Exception as e:
-                logging.error(f"Error in worker thread: {e}")
+                flush_print(f"Error in worker thread: {e}")
 
     pool.closeall()
-    logging.info(f"Scan complete. Total unique keys saved: {total_unique}")
+    flush_print(f"Scan complete. Total unique keys saved: {total_unique}")
 
-# The /scan endpoint now starts the scan in a background thread and streams log messages.
+app = Flask(__name__)
+
+# The /scan endpoint starts the scan in a background thread and returns a simple message.
 @app.route('/scan', methods=['GET'])
 def scan():
-    scan_thread = Thread(target=run_scan)
-    scan_thread.start()
-
-    # Generator to stream log messages from the queue
-    def generate():
-        while scan_thread.is_alive() or not log_queue.empty():
-            try:
-                msg = log_queue.get(timeout=1)
-                yield msg + "\n"
-            except queue.Empty:
-                continue
-
-    headers = {
-        "Content-Type": "text/plain",
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no"
-    }
-    return Response(generate(), headers=headers)
+    Thread(target=run_scan).start()
+    return "Scan started. Check the Render logs for output.\n", 200
 
 if __name__ == '__main__':
-    # Bind to the appropriate port for Render or default to 5000
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
