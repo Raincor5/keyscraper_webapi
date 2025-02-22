@@ -21,18 +21,13 @@ DB_CONFIG = {
     "port": os.getenv("DB_PORT", "5432"),  # Default to PostgreSQL port
 }
 
-# Regex Patterns for API Keys
-API_PATTERNS = {
-    "AWS": r"AKIA[0-9A-Z]{16}",
-    "Google API": r"AIza[0-9A-Za-z-_]{35}",
-    "Stripe": r"sk_live_[0-9a-zA-Z]{24}",
-    "Slack": r"xox[baprs]-[0-9A-Za-z]{10,48}",
-}
+# Regex Pattern for OpenAI API Keys
+OPENAI_API_PATTERN = r"sk-[a-zA-Z0-9]{48}"
 
 # Connect to Database
 def connect_db():
     try:
-        conn = psycopg2.connect(**DB_CONFIG)  # Switch to pymysql.connect for MySQL
+        conn = psycopg2.connect(**DB_CONFIG)  # Switch to pymysql.connect for MySQL if needed
         return conn
     except Exception as e:
         print(f"Database connection error: {e}")
@@ -58,27 +53,22 @@ def setup_db():
     conn.commit()
     conn.close()
 
-
-# GitHub API Search
-def search_github(query, per_page=10):
+# GitHub API Search for OpenAI Keys
+def search_github(per_page=10):
+    query = "sk-"
     url = f"https://api.github.com/search/code?q={query}&per_page={per_page}"
     response = requests.get(url, headers=HEADERS)
 
     if response.status_code == 403:  # Rate limit handling
         print("Rate limited! Sleeping for 60 seconds...")
         time.sleep(60)
-        return search_github(query, per_page)
+        return search_github(per_page)
 
     return response.json().get("items", [])
 
-# Extract API Keys from Code
+# Extract OpenAI API Keys from Code
 def extract_keys(content):
-    found_keys = []
-    for key_type, pattern in API_PATTERNS.items():
-        matches = re.findall(pattern, content)
-        for match in matches:
-            found_keys.append((key_type, match))
-    return found_keys
+    return re.findall(OPENAI_API_PATTERN, content)
 
 # Process Results & Store in DB
 def process_results(results):
@@ -101,30 +91,26 @@ def process_results(results):
         content = file_response.text
         leaked_keys = extract_keys(content)
 
-        for key_type, leaked_key in leaked_keys:
+        for leaked_key in leaked_keys:
             try:
                 cursor.execute("""
                     INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key)
                     VALUES (%s, %s, %s, %s)
                     ON CONFLICT (leaked_key) DO NOTHING;
-                """, (repo_url, file_path, key_type, leaked_key))
+                """, (repo_url, file_path, "OpenAI", leaked_key))
             except psycopg2.Error as e:
                 print(f"Database insertion error: {e}")
 
     conn.commit()
     conn.close()
 
-
 # Main Execution
 def main():
     setup_db()
-    search_terms = ["API_KEY", "SECRET_KEY", "access_token", "AWS_SECRET", "GOOGLE_API_KEY"]
-    
-    for term in search_terms:
-        print(f"Searching for: {term}")
-        results = search_github(term)
-        process_results(results)
-        time.sleep(5)  # Prevent hitting rate limits
+    print("Searching for OpenAI API keys...")
+    results = search_github()
+    process_results(results)
+    time.sleep(5)  # Prevent hitting rate limits
 
 if __name__ == "__main__":
     main()
