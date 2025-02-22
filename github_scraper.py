@@ -1,3 +1,4 @@
+from flask import Flask, jsonify
 import requests
 import re
 import time
@@ -7,7 +8,7 @@ import logging
 from dotenv import load_dotenv
 import sys
 
-# Load Environment Variables
+# Load environment variables
 load_dotenv()
 
 # GitHub API Credentials
@@ -33,33 +34,27 @@ API_PATTERNS = {
     "GitHub Token": r"ghp_[0-9a-zA-Z]{36}",
 }
 
-# Configure logging to stdout with minimal messages
+# Configure minimal logging
 logging.basicConfig(
-    level=logging.INFO,  # Only INFO and above will be logged
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-logging.info("Script started: Searching for leaked API keys.")
+app = Flask(__name__)
 
 def connect_db():
-    """Connects to PostgreSQL and returns the connection."""
     try:
         conn = psycopg2.connect(**DB_CONFIG)
-        logging.info("Connected to the database.")
         return conn
     except Exception as e:
         logging.error(f"Database connection error: {e}")
         return None
 
 def setup_db():
-    """
-    Sets up the leaked_keys table.
-    """
     conn = connect_db()
     if not conn:
         return
-
     cursor = conn.cursor()
     try:
         cursor.execute("""
@@ -74,7 +69,6 @@ def setup_db():
             );
         """)
         conn.commit()
-        logging.info("Database setup complete.")
     except Exception as e:
         logging.error(f"Error setting up database: {e}")
         conn.rollback()
@@ -82,9 +76,6 @@ def setup_db():
         conn.close()
 
 def maybe_sleep_for_rate_limit(response):
-    """
-    Sleeps if GitHub rate limit is nearly reached.
-    """
     remaining = response.headers.get("X-RateLimit-Remaining")
     reset_time = response.headers.get("X-RateLimit-Reset")
     if remaining is not None:
@@ -104,13 +95,9 @@ def maybe_sleep_for_rate_limit(response):
         except ValueError:
             pass
 
-def search_github(per_page=100, max_pages=100):
-    """
-    Fetches pages of results for leaked API keys from GitHub.
-    """
+def search_github(per_page=100, max_pages=5):
     search_terms = ["OPEN_API_KEY=sk-", "AKIA", "AIza", "sk_live_", "xoxb", "ghp_"]
     all_results = []
-
     for query in search_terms:
         page = 1
         while page <= max_pages:
@@ -118,35 +105,23 @@ def search_github(per_page=100, max_pages=100):
             try:
                 response = requests.get(url, headers=HEADERS)
                 maybe_sleep_for_rate_limit(response)
-
                 if response.status_code == 403:
-                    logging.warning("Rate limit hit! Sleeping 60s...")
                     time.sleep(60)
                     continue
-
                 if response.status_code != 200:
-                    logging.error(f"GitHub API Error: {response.status_code} - {response.text}")
                     break
-
                 items = response.json().get("items", [])
                 if not items:
                     break
-
                 all_results.extend(items)
             except Exception as e:
                 logging.error(f"GitHub API request failed: {e}")
                 break
-
             page += 1
             time.sleep(2)
-
-    logging.info(f"Total GitHub search results fetched: {len(all_results)}")
     return all_results
 
 def extract_keys(content):
-    """
-    Extracts API keys from content using defined regex patterns.
-    """
     found_keys = []
     for key_type, pattern in API_PATTERNS.items():
         matches = re.findall(pattern, content)
@@ -155,15 +130,10 @@ def extract_keys(content):
     return found_keys
 
 def fetch_raw_content(item):
-    """
-    Retrieves raw file content using 'download_url' or fallback to 'html_url'.
-    """
     download_url = item.get("download_url")
     file_url = download_url if download_url else item.get("html_url")
-
     if not file_url:
         return None, None
-
     try:
         response = requests.get(file_url, headers=HEADERS)
         maybe_sleep_for_rate_limit(response)
@@ -175,52 +145,37 @@ def fetch_raw_content(item):
         return file_url, None
 
 def process_results(results):
-    """
-    Processes search results, extracts unique keys, inserts them into the DB,
-    and prints each unique key (truncated) along with an updated counter.
-    """
     conn = connect_db()
     if not conn:
-        logging.error("Database connection failed.")
-        return
-
+        return 0
     cursor = conn.cursor()
     total_inserted = 0
     unique_keys_set = set()
-
     for item in results:
         repo_url = item["repository"]["html_url"]
         file_path = item["path"]
         actual_url, content = fetch_raw_content(item)
         if not content:
             continue
-
         leaked_keys = extract_keys(content)
         if not leaked_keys:
             continue
-
         for key_type, leaked_key in leaked_keys:
             try:
                 cursor.execute("""
-                    SELECT id
-                    FROM leaked_keys
-                    WHERE repo_url = %s
-                      AND file_path = %s
-                      AND leaked_key = %s
+                    SELECT id FROM leaked_keys
+                    WHERE repo_url = %s AND file_path = %s AND leaked_key = %s
                 """, (repo_url, file_path, leaked_key))
                 existing = cursor.fetchone()
-
                 if existing:
                     continue
-
                 cursor.execute("""
                     INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key)
                     VALUES (%s, %s, %s, %s)
                     RETURNING id;
                 """, (repo_url, file_path, key_type, leaked_key))
-                new_id = cursor.fetchone()[0]
+                cursor.fetchone()
                 total_inserted += 1
-
                 if leaked_key not in unique_keys_set:
                     unique_keys_set.add(leaked_key)
                     print(f"Unique key: {leaked_key[:10]}... | Count: {len(unique_keys_set)}")
@@ -228,25 +183,28 @@ def process_results(results):
                 logging.error(f"Database insertion error: {e}")
                 conn.rollback()
                 continue
-
     try:
         conn.commit()
-        logging.info(f"Database transaction committed. {total_inserted} new records inserted.")
     except Exception as e:
         logging.error(f"Error committing transaction: {e}")
         conn.rollback()
     finally:
         conn.close()
+    return len(unique_keys_set)
 
-def main():
-    logging.info("Starting API key scanning process...")
+@app.route('/scan', methods=['GET'])
+def scan():
     setup_db()
     results = search_github()
     if results:
-        process_results(results)
+        unique_count = process_results(results)
+        return jsonify({
+            "status": "success",
+            "unique_keys_saved": unique_count
+        })
     else:
-        logging.info("No items returned from the GitHub API search.")
-    logging.info("Execution complete.")
+        return jsonify({"status": "no results found"}), 404
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    # Bind to the appropriate port for Render or default to 5000
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
