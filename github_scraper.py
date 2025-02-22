@@ -1,4 +1,4 @@
-from flask import Flask, Response, stream_with_context
+from flask import Flask, Response
 import requests
 import re
 import time
@@ -7,6 +7,8 @@ import psycopg2
 import logging
 from dotenv import load_dotenv
 import sys
+import queue
+from threading import Thread
 
 # Load environment variables
 load_dotenv()
@@ -34,12 +36,30 @@ API_PATTERNS = {
     "GitHub Token": r"ghp_[0-9a-zA-Z]{36}",
 }
 
-# Configure minimal logging
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
+
+# Create a queue to capture log messages
+log_queue = queue.Queue()
+
+class QueueHandler(logging.Handler):
+    def __init__(self, q):
+        super().__init__()
+        self.queue = q
+
+    def emit(self, record):
+        log_entry = self.format(record)
+        self.queue.put(log_entry)
+
+# Attach our custom handler to the root logger
+queue_handler = QueueHandler(log_queue)
+queue_handler.setLevel(logging.INFO)
+queue_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+logging.getLogger().addHandler(queue_handler)
 
 app = Flask(__name__)
 
@@ -69,6 +89,7 @@ def setup_db():
             );
         """)
         conn.commit()
+        logging.info("Database setup complete.")
     except Exception as e:
         logging.error(f"Error setting up database: {e}")
         conn.rollback()
@@ -144,82 +165,90 @@ def fetch_raw_content(item):
         logging.error(f"Error fetching file content from {file_url}: {e}")
         return file_url, None
 
-@app.route('/scan', methods=['GET'])
-def scan():
-    @stream_with_context
-    def generate():
-        yield "Starting scan...\n"
-        yield "Setting up database...\n"
-        setup_db()
-        yield "Database setup complete.\n"
-        
-        yield "Searching GitHub...\n"
-        results = search_github()
-        yield f"Fetched {len(results)} GitHub results.\n"
-        if not results:
-            yield "No results returned from GitHub API.\n"
-            return
-        
-        conn = connect_db()
-        if not conn:
-            yield "Database connection error. Scan aborted.\n"
-            return
+def run_scan():
+    logging.info("Starting scan...")
+    setup_db()
+    results = search_github()
+    logging.info(f"Fetched {len(results)} GitHub results.")
+    if not results:
+        logging.info("No results returned from GitHub API.")
+        logging.info("Scan complete.")
+        return
 
-        cursor = conn.cursor()
-        unique_count = 0
-        unique_keys_set = set()
+    conn = connect_db()
+    if not conn:
+        logging.error("Database connection error. Scan aborted.")
+        return
 
-        for item in results:
-            repo_url = item["repository"]["html_url"]
-            file_path = item["path"]
-            yield f"Processing file: {repo_url}/{file_path}\n"
-            actual_url, content = fetch_raw_content(item)
-            if not content:
-                yield f"Failed to fetch content for {actual_url}\n"
-                continue
+    cursor = conn.cursor()
+    unique_count = 0
+    unique_keys_set = set()
 
-            leaked_keys = extract_keys(content)
-            if not leaked_keys:
-                yield f"No keys found in {actual_url}\n"
-                continue
+    for item in results:
+        repo_url = item["repository"]["html_url"]
+        file_path = item["path"]
+        logging.info(f"Processing file: {repo_url}/{file_path}")
+        actual_url, content = fetch_raw_content(item)
+        if not content:
+            logging.info(f"Failed to fetch content for {actual_url}")
+            continue
 
-            for key_type, leaked_key in leaked_keys:
-                try:
-                    cursor.execute("""
-                        SELECT id FROM leaked_keys
-                        WHERE repo_url = %s AND file_path = %s AND leaked_key = %s
-                    """, (repo_url, file_path, leaked_key))
-                    if cursor.fetchone():
-                        yield f"Key already exists for {repo_url}/{file_path}\n"
-                        continue
+        leaked_keys = extract_keys(content)
+        if not leaked_keys:
+            logging.info(f"No keys found in {actual_url}")
+            continue
 
-                    cursor.execute("""
-                        INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key)
-                        VALUES (%s, %s, %s, %s)
-                        RETURNING id;
-                    """, (repo_url, file_path, key_type, leaked_key))
-                    cursor.fetchone()
-                    if leaked_key not in unique_keys_set:
-                        unique_keys_set.add(leaked_key)
-                        unique_count += 1
-                        yield f"Unique key: {leaked_key[:10]}... | Count: {unique_count}\n"
-                except Exception as e:
-                    yield f"Database insertion error for {repo_url}/{file_path}: {e}\n"
-                    conn.rollback()
+        for key_type, leaked_key in leaked_keys:
+            try:
+                cursor.execute("""
+                    SELECT id FROM leaked_keys
+                    WHERE repo_url = %s AND file_path = %s AND leaked_key = %s
+                """, (repo_url, file_path, leaked_key))
+                if cursor.fetchone():
+                    logging.info(f"Key already exists for {repo_url}/{file_path}")
                     continue
 
-        try:
-            conn.commit()
-            yield f"Database commit successful. Total unique keys saved: {unique_count}\n"
-        except Exception as e:
-            yield f"Error committing transaction: {e}\n"
-            conn.rollback()
-        finally:
-            conn.close()
+                cursor.execute("""
+                    INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id;
+                """, (repo_url, file_path, key_type, leaked_key))
+                cursor.fetchone()
+                if leaked_key not in unique_keys_set:
+                    unique_keys_set.add(leaked_key)
+                    unique_count += 1
+                    logging.info(f"Unique key: {leaked_key[:10]}... | Count: {unique_count}")
+            except Exception as e:
+                logging.error(f"Database insertion error for {repo_url}/{file_path}: {e}")
+                conn.rollback()
+                continue
 
-        yield "Scan complete.\n"
+    try:
+        conn.commit()
+        logging.info(f"Database commit successful. Total unique keys saved: {unique_count}")
+    except Exception as e:
+        logging.error(f"Error committing transaction: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
 
-    # Set headers to disable buffering for a live tail effect
+    logging.info("Scan complete.")
+
+@app.route('/scan', methods=['GET'])
+def scan():
+    # Start the scan process in a background thread
+    scan_thread = Thread(target=run_scan)
+    scan_thread.start()
+
+    # Generator to stream log messages from the queue
+    def generate():
+        while scan_thread.is_alive() or not log_queue.empty():
+            try:
+                msg = log_queue.get(timeout=1)
+                yield msg + "\n"
+            except queue.Empty:
+                continue
+
     headers = {
         "Content-Type": "text/plain",
         "Cache-Control": "no-cache",
