@@ -5,6 +5,7 @@ import os
 import psycopg2
 import logging
 from dotenv import load_dotenv
+import sys
 
 # Load Environment Variables
 load_dotenv()
