@@ -32,11 +32,13 @@ API_PATTERNS = {
     "GitHub Token": r"ghp_[0-9a-zA-Z]{36}",
 }
 
-# Set up logging
+# Set up logging to print to stdout for Render compatibility
 logging.basicConfig(
-    filename="leaked_keys.log",
-    level=logging.DEBUG,  # More detailed logs
+    level=logging.DEBUG,  # Change to INFO or ERROR in production
     format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)  # Logs to stdout for Render
+    ]
 )
 
 logging.info("🔍 Script started: Searching for leaked API keys.")
