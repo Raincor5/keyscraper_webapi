@@ -4,3 +4,6 @@ dotenv
 flask
 celery
 tenacity
+aiohttp
+asyncpg
+asyncio
