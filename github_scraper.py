@@ -19,7 +19,7 @@ DB_CONFIG = {
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASSWORD"),
     "host": os.getenv("DB_HOST"),
-    "port": os.getenv("DB_PORT", "5432"),  # Default to PostgreSQL port
+    "port": os.getenv("DB_PORT", "5432"),
 }
 
 # API Key Patterns
@@ -35,18 +35,20 @@ API_PATTERNS = {
 # Set up logging
 logging.basicConfig(
     filename="leaked_keys.log",
-    level=logging.INFO,
+    level=logging.DEBUG,  # More detailed logs
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
+
+logging.info("🔍 Script started: Searching for leaked API keys.")
 
 # Connect to Database
 def connect_db():
     try:
-        conn = psycopg2.connect(**DB_CONFIG)  # Switch to pymysql.connect for MySQL if needed
-        logging.info("Connected to the database successfully.")
+        conn = psycopg2.connect(**DB_CONFIG)
+        logging.info("✅ Connected to the database successfully.")
         return conn
     except Exception as e:
-        logging.error(f"Database connection error: {e}")
+        logging.error(f"❌ Database connection error: {e}")
         return None
 
 def setup_db():
@@ -56,21 +58,22 @@ def setup_db():
 
     cursor = conn.cursor()
     try:
+        logging.info("⚙️ Setting up database...")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS leaked_keys (
                 id SERIAL PRIMARY KEY,
                 repo_url TEXT NOT NULL,
                 file_path TEXT NOT NULL,
                 key_type TEXT NOT NULL,
-                leaked_key TEXT NOT NULL UNIQUE,  -- Ensure uniqueness
+                leaked_key TEXT NOT NULL UNIQUE,
                 detected_at TIMESTAMP DEFAULT NOW(),
                 notified BOOLEAN DEFAULT FALSE
             );
         """)
         conn.commit()
-        logging.info("Database setup completed with UNIQUE constraint on leaked_key.")
+        logging.info("✅ Database setup complete.")
     except Exception as e:
-        logging.error(f"Error setting up database: {e}")
+        logging.error(f"❌ Error setting up database: {e}")
         conn.rollback()
     finally:
         conn.close()
@@ -85,36 +88,37 @@ def search_github(per_page=100, max_pages=10):
         page = 1
         while page <= max_pages:
             url = f"https://api.github.com/search/code?q={query}&per_page={per_page}&page={page}"
-            logging.info(f"Fetching page {page} for query: {query}")
+            logging.info(f"🔍 Searching GitHub: '{query}' (Page {page})")
 
             try:
                 response = requests.get(url, headers=HEADERS)
-                
-                if response.status_code == 403:  # Rate limit handling
-                    logging.warning("Rate limited! Sleeping for 60 seconds...")
+                logging.info(f"🔄 GitHub API Response: {response.status_code}")
+
+                if response.status_code == 403:
+                    logging.warning("⏳ Rate limit hit! Sleeping for 60 seconds...")
                     time.sleep(60)
-                    continue  # Retry the same page after sleeping
+                    continue  
 
                 if response.status_code != 200:
-                    logging.error(f"GitHub API Error: {response.status_code} - {response.text}")
-                    break  # Stop fetching if there's an error
+                    logging.error(f"❌ GitHub API Error: {response.status_code} - {response.text}")
+                    break  
 
                 items = response.json().get("items", [])
                 if not items:
-                    logging.info(f"No more results found for {query} on page {page}. Stopping.")
-                    break  # Stop if GitHub returns no more results
+                    logging.info(f"✅ No more results for '{query}' on Page {page}. Stopping.")
+                    break  
 
                 all_results.extend(items)
-                logging.info(f"Fetched {len(items)} results from page {page} for {query}.")
+                logging.info(f"✅ Fetched {len(items)} results from '{query}' on Page {page}.")
 
             except Exception as e:
-                logging.error(f"GitHub API request failed: {e}")
-                break  # Stop on critical failure
+                logging.error(f"❌ GitHub API request failed: {e}")
+                break  
 
             page += 1
-            time.sleep(2)  # Delay to avoid hitting rate limits
+            time.sleep(2)  
 
-    logging.info(f"Total results fetched: {len(all_results)}")
+    logging.info(f"📊 Total results fetched: {len(all_results)}")
     return all_results
 
 # Extract API Keys from Code
@@ -124,7 +128,9 @@ def extract_keys(content):
         matches = re.findall(pattern, content)
         for match in matches:
             found_keys.append((key_type, match))
-    logging.info(f"Extracted {len(found_keys)} API keys from content.")
+            logging.debug(f"🔑 Found {key_type} key: {match[:10]}...")  
+
+    logging.info(f"📌 Extracted {len(found_keys)} API keys from content.")
     return found_keys
 
 # Process Results & Store in DB
@@ -140,18 +146,17 @@ def process_results(results):
         file_path = item["path"]
         file_url = item["html_url"]
 
-        logging.info(f"Processing file: {file_url}")
+        logging.info(f"📄 Processing file: {file_url}")
 
-        # Get file content
         try:
             file_response = requests.get(file_url, headers=HEADERS)
             if file_response.status_code != 200:
-                logging.warning(f"Failed to fetch file content: {file_url}")
+                logging.warning(f"⚠️ Failed to fetch file content: {file_url}")
                 continue
 
             content = file_response.text
         except Exception as e:
-            logging.error(f"Error fetching file content: {e}")
+            logging.error(f"❌ Error fetching file content: {e}")
             continue
 
         leaked_keys = extract_keys(content)
@@ -164,33 +169,33 @@ def process_results(results):
                     ON CONFLICT (leaked_key) DO NOTHING;
                 """, (repo_url, file_path, key_type, leaked_key))
 
-                logging.info(f"Inserted {key_type} key from {file_path} into database.")
+                logging.info(f"✅ Stored {key_type} key from {file_path} into database.")
 
             except psycopg2.Error as e:
-                logging.error(f"Database insertion error: {e}")
-                conn.rollback()  # Rollback transaction if an error occurs
+                logging.error(f"❌ Database insertion error: {e}")
+                conn.rollback()
 
     try:
         conn.commit()
-        logging.info("Database transaction committed successfully.")
+        logging.info("✅ Database transaction committed successfully.")
     except Exception as e:
-        logging.error(f"Error committing transaction: {e}")
+        logging.error(f"❌ Error committing transaction: {e}")
         conn.rollback()
     finally:
         conn.close()
 
 # Main Execution
 def main():
+    logging.info("🚀 Starting API key scanning process...")
     setup_db()
-    logging.info("Starting search for API keys...")
 
     results = search_github()
     if results:
         process_results(results)
     else:
-        logging.info("No results found.")
+        logging.info("ℹ️ No API keys found in the search.")
 
-    logging.info("Execution complete.")
+    logging.info("🏁 Execution complete.")
 
 if __name__ == "__main__":
     main()
