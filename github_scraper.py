@@ -1,4 +1,4 @@
-from flask import Flask, jsonify
+from flask import Flask, Response, stream_with_context
 import requests
 import re
 import time
@@ -144,66 +144,83 @@ def fetch_raw_content(item):
         logging.error(f"Error fetching file content from {file_url}: {e}")
         return file_url, None
 
-def process_results(results):
-    conn = connect_db()
-    if not conn:
-        return 0
-    cursor = conn.cursor()
-    total_inserted = 0
-    unique_keys_set = set()
-    for item in results:
-        repo_url = item["repository"]["html_url"]
-        file_path = item["path"]
-        actual_url, content = fetch_raw_content(item)
-        if not content:
-            continue
-        leaked_keys = extract_keys(content)
-        if not leaked_keys:
-            continue
-        for key_type, leaked_key in leaked_keys:
-            try:
-                cursor.execute("""
-                    SELECT id FROM leaked_keys
-                    WHERE repo_url = %s AND file_path = %s AND leaked_key = %s
-                """, (repo_url, file_path, leaked_key))
-                existing = cursor.fetchone()
-                if existing:
-                    continue
-                cursor.execute("""
-                    INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key)
-                    VALUES (%s, %s, %s, %s)
-                    RETURNING id;
-                """, (repo_url, file_path, key_type, leaked_key))
-                cursor.fetchone()
-                total_inserted += 1
-                if leaked_key not in unique_keys_set:
-                    unique_keys_set.add(leaked_key)
-                    print(f"Unique key: {leaked_key[:10]}... | Count: {len(unique_keys_set)}")
-            except psycopg2.Error as e:
-                logging.error(f"Database insertion error: {e}")
-                conn.rollback()
-                continue
-    try:
-        conn.commit()
-    except Exception as e:
-        logging.error(f"Error committing transaction: {e}")
-        conn.rollback()
-    finally:
-        conn.close()
-    return len(unique_keys_set)
-
 @app.route('/scan', methods=['GET'])
 def scan():
-    setup_db()
-    results = search_github()
-    if results:
-        unique_count = process_results(results)
-        return jsonify({
-            "status": "success",
-            "unique_keys_saved": unique_count
-        })
-    else:
-        return jsonify({"status": "no results found"}), 404
+    @stream_with_context
+    def generate():
+        yield "Starting scan...\n"
+        yield "Setting up database...\n"
+        setup_db()
+        yield "Database setup complete.\n"
+
+        yield "Searching GitHub...\n"
+        results = search_github()
+        yield f"Fetched {len(results)} GitHub results.\n"
+
+        if not results:
+            yield "No results returned from GitHub API.\n"
+            return
+
+        conn = connect_db()
+        if not conn:
+            yield "Database connection error. Scan aborted.\n"
+            return
+
+        cursor = conn.cursor()
+        unique_count = 0
+        unique_keys_set = set()
+
+        for item in results:
+            repo_url = item["repository"]["html_url"]
+            file_path = item["path"]
+            yield f"Processing file: {repo_url}/{file_path}\n"
+            actual_url, content = fetch_raw_content(item)
+            if not content:
+                yield f"Failed to fetch content for {actual_url}\n"
+                continue
+
+            leaked_keys = extract_keys(content)
+            if not leaked_keys:
+                yield f"No keys found in {actual_url}\n"
+                continue
+
+            for key_type, leaked_key in leaked_keys:
+                try:
+                    cursor.execute("""
+                        SELECT id FROM leaked_keys
+                        WHERE repo_url = %s AND file_path = %s AND leaked_key = %s
+                    """, (repo_url, file_path, leaked_key))
+                    if cursor.fetchone():
+                        yield f"Key already exists for {repo_url}/{file_path}\n"
+                        continue
+
+                    cursor.execute("""
+                        INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key)
+                        VALUES (%s, %s, %s, %s)
+                        RETURNING id;
+                    """, (repo_url, file_path, key_type, leaked_key))
+                    cursor.fetchone()
+                    if leaked_key not in unique_keys_set:
+                        unique_keys_set.add(leaked_key)
+                        unique_count += 1
+                        yield f"Unique key: {leaked_key[:10]}... | Count: {unique_count}\n"
+                except Exception as e:
+                    yield f"Database insertion error for key from {repo_url}/{file_path}: {e}\n"
+                    conn.rollback()
+                    continue
+
+        try:
+            conn.commit()
+            yield f"Database commit successful. Total unique keys saved: {unique_count}\n"
+        except Exception as e:
+            yield f"Error committing transaction: {e}\n"
+            conn.rollback()
+        finally:
+            conn.close()
+
+        yield "Scan complete.\n"
+
+    return Response(generate(), mimetype="text/plain")
 
 if __name__ == '__main__':
     # Bind to the appropriate port for Render or default to 5000
