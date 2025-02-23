@@ -7,7 +7,7 @@ import time
 import logging
 from datetime import datetime
 from tenacity import retry, wait_exponential, stop_after_attempt
-from celery import Celery
+from celery import Celery, group
 from flask import Flask
 
 # --- Configuration Management ---
@@ -18,6 +18,7 @@ DB_DSN = os.environ.get("DATABASE_URL") or (
 )
 BROKER_URL = os.environ.get("BROKER_URL", "redis://localhost:6379/0")
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
+# Increase MAX_PAGES as needed to extract more keys.
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
 # --- End Configuration ---
 
@@ -56,7 +57,6 @@ def create_flask_app():
 flask_app = create_flask_app()
 
 # --- API Patterns and Search Terms ---
-# Mapping API pattern names to their GitHub search term.
 PATTERN_SEARCH_TERMS = {
     "OpenAI": "OPEN_API_KEY=sk-",
     "AWS": "AKIA",
@@ -226,13 +226,18 @@ async def process_item(item, pool):
 def celery_run_scan_for_pattern(pattern_name):
     asyncio.run(run_scan_for_pattern(pattern_name))
 
-# Master task to dispatch scan tasks for all patterns.
+# Master task to dispatch scan tasks for all patterns using a Celery group.
 @celery.task(name="dispatch_all_scans")
 def dispatch_all_scans():
+    tasks = []
     for pattern_name in PATTERN_SEARCH_TERMS.keys():
-        # Route each task to its dedicated queue.
         queue_name = f"scan_{pattern_name.lower().replace(' ', '_')}"
-        celery_run_scan_for_pattern.apply_async(args=[pattern_name], queue=queue_name)
+        tasks.append(celery_run_scan_for_pattern.s(pattern_name).set(queue=queue_name))
+    # Create a group of all scan tasks.
+    result = group(tasks).apply_async()
+    # Wait for all scan tasks to complete.
+    result.join()  # This blocks until all tasks finish.
+    logger.info("All scan tasks completed.")
 # --- End Celery Tasks ---
 
 if __name__ == "__main__":
