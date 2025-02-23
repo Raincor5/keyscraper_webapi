@@ -42,6 +42,26 @@ celery.conf.update(
     timezone="UTC",
     enable_utc=True,
 )
+
+
+# --- Celery Tasks ---
+@celery.task(name="celery_run_scan_for_pattern")
+def celery_run_scan_for_pattern(pattern_name):
+    asyncio.run(run_scan_for_pattern(pattern_name))
+
+@celery.task(name="all_scans_completed")
+def all_scans_completed(results):
+    logger.info("All scan tasks completed. Results: %s", results)
+
+@celery.task(name="dispatch_all_scans")
+def dispatch_all_scans():
+    tasks = []
+    for pattern_name in PATTERN_SEARCH_TERMS.keys():
+        queue_name = f"scan_{pattern_name.lower().replace(' ', '_')}"
+        tasks.append(celery_run_scan_for_pattern.s(pattern_name).set(queue=queue_name))
+    chord(tasks)(all_scans_completed.s())
+# --- End Celery Tasks ---
+
 # --- End Celery Setup ---
 
 def create_flask_app():
@@ -205,4 +225,42 @@ async def process_item(item, pool):
     file_path = item["path"]
     logger.info(f"Processing file: {repo_url}/{file_path}")
     download_url = item.get("download_url")
-    file_url = download_ur
+    file_url = download_url if download_url else item.get("html_url")
+    if not file_url:
+        logger.info(f"No file URL for {repo_url}/{file_path}")
+        return 0
+    try:
+        content = await fetch_file_content(file_url)
+    except Exception as e:
+        logger.error(f"Error fetching file {file_url}: {e}")
+        return 0
+    leaked_keys = []
+    for key_type, compiled in COMPILED_PATTERNS.items():
+        matches = compiled.findall(content)
+        for match in matches:
+            leaked_keys.append((key_type, match))
+    if not leaked_keys:
+        logger.info(f"No keys found in {file_url}")
+        return 0
+    unique_count = 0
+    async with pool.acquire() as conn:
+        for key_type, leaked_key in leaked_keys:
+            row = await conn.fetchrow(
+                "SELECT id FROM leaked_keys WHERE repo_url=$1 AND file_path=$2 AND leaked_key=$3",
+                repo_url, file_path, leaked_key
+            )
+            if row:
+                logger.info(f"Key already exists for {repo_url}/{file_path}")
+                continue
+            row = await conn.fetchrow(
+                "INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key) VALUES ($1, $2, $3, $4) RETURNING id",
+                repo_url, file_path, key_type, leaked_key
+            )
+            unique_count += 1
+            logger.info(f"Unique key: {leaked_key[:10]}... | Inserted ID: {row['id']}")
+    return unique_count
+# --- End GitHub Search & Processing ---
+
+
+if __name__ == "__main__":
+    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
