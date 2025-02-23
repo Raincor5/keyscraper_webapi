@@ -22,6 +22,8 @@ HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
 # Use an hourly window; configure via environment variable.
 WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "1"))
+# Default period (e.g., 30 days) if no previous scan.
+DEFAULT_DAYS = int(os.environ.get("DEFAULT_DAYS", "30"))
 # --- End Configuration ---
 
 # --- Logging Setup ---
@@ -42,38 +44,15 @@ celery.conf.update(
     timezone="UTC",
     enable_utc=True,
 )
-
-
-# --- Celery Tasks ---
-@celery.task(name="celery_run_scan_for_pattern")
-def celery_run_scan_for_pattern(pattern_name):
-    asyncio.run(run_scan_for_pattern(pattern_name))
-
-@celery.task(name="all_scans_completed")
-def all_scans_completed(results):
-    logger.info("All scan tasks completed. Results: %s", results)
-
-@celery.task(name="dispatch_all_scans")
-def dispatch_all_scans():
-    tasks = []
-    for pattern_name in PATTERN_SEARCH_TERMS.keys():
-        queue_name = f"scan_{pattern_name.lower().replace(' ', '_')}"
-        tasks.append(celery_run_scan_for_pattern.s(pattern_name).set(queue=queue_name))
-    chord(tasks)(all_scans_completed.s())
-# --- End Celery Tasks ---
-
 # --- End Celery Setup ---
 
 def create_flask_app():
     """Factory function to create and configure the Flask app."""
     app = Flask(__name__)
-
     @app.route("/", methods=["GET"])
     def index():
-        # Dispatch scan tasks for each API pattern
         dispatch_all_scans.delay()
         return "Dispatched individual scan tasks. Check logs for output.\n"
-
     return app
 
 flask_app = create_flask_app()
@@ -160,66 +139,36 @@ async def fetch_file_content(url):
             return await response.text()
 # --- End HTTP Helpers ---
 
-# --- GitHub Search & Processing for a Single Pattern ---
-async def run_scan_for_pattern(pattern_name):
-    search_term = PATTERN_SEARCH_TERMS.get(pattern_name)
-    if not search_term:
-        logger.error(f"No search term defined for pattern: {pattern_name}")
-        return
+# --- Task to Scan a Single Page in a Time Window for a Given Pattern ---
+@celery.task(name="celery_scan_page")
+def celery_scan_page(pattern_name, window_start_str, window_end_str, page):
+    window_start = datetime.fromisoformat(window_start_str)
+    window_end = datetime.fromisoformat(window_end_str)
+    return asyncio.run(scan_page(pattern_name, window_start, window_end, page))
 
-    logger.info(f"Starting async scan for pattern: {pattern_name} ({search_term})")
+async def scan_page(pattern_name, window_start, window_end, page):
     pool = await asyncpg.create_pool(dsn=DB_DSN)
     await setup_db(pool)
-
-    # Determine the time window for scanning.
-    last_scanned = await get_last_scanned(pool)
-    if last_scanned:
-        start_time = last_scanned
-    else:
-        # If no previous scan, start from a default time (e.g., 30 days ago).
-        start_time = datetime.utcnow() - timedelta(days=30)
-    end_time = datetime.utcnow()
-
-    current_time = start_time
-    total_unique = 0
-
-    # Iterate over time windows (using an hourly window).
-    while current_time < end_time:
-        window_end = min(current_time + timedelta(hours=WINDOW_HOURS), end_time)
-        # Use GitHub's pushed range syntax.
-        time_filter = f" pushed:{current_time.isoformat()}..{window_end.isoformat()}"
-        logger.info(f"Scanning window: {current_time.isoformat()} to {window_end.isoformat()}")
-
-        results = []
-        for page in range(1, MAX_PAGES + 1):
-            query = search_term + time_filter
-            url = f"https://api.github.com/search/code?q={query}&per_page=1000&page={page}"
-            try:
-                data = await fetch_github(url)
-                items = data.get("items", [])
-                if not items:
-                    break
-                results.extend(items)
-            except Exception as e:
-                logger.error(f"Error fetching GitHub items for pattern {pattern_name} in window {time_filter}: {e}")
-                break
-            await asyncio.sleep(2)
-        
-        # Process the results from this time window.
-        tasks = [process_item(item, pool) for item in results]
+    search_term = PATTERN_SEARCH_TERMS.get(pattern_name)
+    query = f"{search_term} pushed:{window_start.isoformat()}..{window_end.isoformat()}"
+    url = f"https://api.github.com/search/code?q={query}&per_page=1000&page={page}"
+    try:
+        data = await fetch_github(url)
+        items = data.get("items", [])
+        if not items:
+            await pool.close()
+            return 0
+        tasks = [process_item(item, pool) for item in items]
         counts = await asyncio.gather(*tasks, return_exceptions=True)
-        for count in counts:
-            if isinstance(count, Exception):
-                logger.error(f"Error in processing task: {count}")
-            else:
-                total_unique += count
+        total = sum(count for count in counts if not isinstance(count, Exception))
+        await pool.close()
+        return total
+    except Exception as e:
+        await pool.close()
+        raise e
+# --- End Single Page Task ---
 
-        current_time = window_end
-
-    logger.info(f"Scan complete for {pattern_name}. Total unique keys saved: {total_unique}")
-    await update_last_scanned(pool, datetime.utcnow())
-    await pool.close()
-
+# --- Task to Process an Individual File ---
 async def process_item(item, pool):
     repo_url = item["repository"]["html_url"]
     file_path = item["path"]
@@ -259,8 +208,37 @@ async def process_item(item, pool):
             unique_count += 1
             logger.info(f"Unique key: {leaked_key[:10]}... | Inserted ID: {row['id']}")
     return unique_count
-# --- End GitHub Search & Processing ---
+# --- End File Processing ---
 
+# --- Dispatching Tasks Across Workers ---
+@celery.task(name="dispatch_all_scans")
+def dispatch_all_scans():
+    tasks = []
+    now = datetime.utcnow()
+    for pattern_name in PATTERN_SEARCH_TERMS.keys():
+        # Get last scanned time for the pattern.
+        # For simplicity, use default start time (e.g., 30 days ago).
+        start_time = now - timedelta(days=DEFAULT_DAYS)
+        current_time = start_time
+        while current_time < now:
+            window_end = min(current_time + timedelta(hours=WINDOW_HOURS), now)
+            for page in range(1, MAX_PAGES + 1):
+                tasks.append(
+                    celery_scan_page.s(
+                        pattern_name,
+                        current_time.isoformat(),
+                        window_end.isoformat(),
+                        page
+                    )
+                )
+            current_time = window_end
+    # Use a chord to execute a callback once all page tasks are done.
+    chord(tasks)(all_scans_completed.s())
+    
+@celery.task(name="all_scans_completed")
+def all_scans_completed(results):
+    logger.info("All scan tasks completed. Results: %s", results)
+# --- End Task Dispatching ---
 
 if __name__ == "__main__":
     flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
