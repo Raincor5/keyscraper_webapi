@@ -142,7 +142,13 @@ async def fetch_file_content(url):
 def celery_scan_page(pattern_name, window_start_str, window_end_str, page):
     window_start = datetime.fromisoformat(window_start_str)
     window_end = datetime.fromisoformat(window_end_str)
-    return asyncio.run(scan_page(pattern_name, window_start, window_end, page))
+    try:
+        result = asyncio.run(scan_page(pattern_name, window_start, window_end, page))
+        return result
+    except Exception as e:
+        # Raise a simple exception with a string message to ensure it's pickleable.
+        raise Exception(f"celery_scan_page failed for pattern {pattern_name} page {page}: {str(e)}")
+
 
 async def scan_page(pattern_name, window_start, window_end, page):
     pool = await asyncpg.create_pool(dsn=DB_DSN)
