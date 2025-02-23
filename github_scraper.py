@@ -7,7 +7,7 @@ import time
 import logging
 from datetime import datetime
 from tenacity import retry, wait_exponential, stop_after_attempt
-from celery import Celery, group
+from celery import Celery, chord
 from flask import Flask
 
 # --- Configuration Management ---
@@ -226,18 +226,20 @@ async def process_item(item, pool):
 def celery_run_scan_for_pattern(pattern_name):
     asyncio.run(run_scan_for_pattern(pattern_name))
 
-# Master task to dispatch scan tasks for all patterns using a Celery group.
+# Callback task to be executed once all scan tasks complete.
+@celery.task(name="all_scans_completed")
+def all_scans_completed(results):
+    logger.info("All scan tasks completed. Results: %s", results)
+
+# Master task to dispatch scan tasks for all patterns using a Celery chord.
 @celery.task(name="dispatch_all_scans")
 def dispatch_all_scans():
     tasks = []
     for pattern_name in PATTERN_SEARCH_TERMS.keys():
         queue_name = f"scan_{pattern_name.lower().replace(' ', '_')}"
         tasks.append(celery_run_scan_for_pattern.s(pattern_name).set(queue=queue_name))
-    # Create a group of all scan tasks.
-    result = group(tasks).apply_async()
-    # Wait for all scan tasks to complete.
-    result.join()  # This blocks until all tasks finish.
-    logger.info("All scan tasks completed.")
+    # Create a chord that executes the callback when all tasks complete.
+    chord(tasks)(all_scans_completed.s())
 # --- End Celery Tasks ---
 
 if __name__ == "__main__":
