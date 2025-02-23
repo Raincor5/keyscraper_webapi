@@ -46,6 +46,7 @@ celery.conf.update(
 # --- End Celery Setup ---
 
 def create_flask_app():
+    """Factory function to create and configure the Flask app."""
     app = Flask(__name__)
     @app.route("/", methods=["GET"])
     def index():
@@ -114,6 +115,13 @@ async def fetch_github(url):
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers, timeout=HTTP_TIMEOUT) as response:
+            if response.status == 422:
+                text = await response.text()
+                if "Cannot access beyond the first 1000 results" in text:
+                    logger.warning("GitHub API error 422: Cannot access beyond the first 1000 results. Returning empty result.")
+                    return {"items": []}
+                else:
+                    raise Exception(f"GitHub API error {response.status}: {text}")
             if response.status == 403:
                 logger.warning("Rate limited by GitHub, sleeping for 60 seconds...")
                 await asyncio.sleep(60)
@@ -146,9 +154,7 @@ def celery_scan_page(pattern_name, window_start_str, window_end_str, page):
         result = asyncio.run(scan_page(pattern_name, window_start, window_end, page))
         return result
     except Exception as e:
-        # Raise a simple exception with a string message to ensure it's pickleable.
         raise Exception(f"celery_scan_page failed for pattern {pattern_name} page {page}: {str(e)}")
-
 
 async def scan_page(pattern_name, window_start, window_end, page):
     pool = await asyncpg.create_pool(dsn=DB_DSN)
@@ -228,8 +234,15 @@ def dispatch_window(_, pattern_name, window_start_str, window_end_str, now_str):
     if window_end < now:
         next_start = window_end
         next_end = min(next_start + timedelta(hours=WINDOW_HOURS), now)
-        tasks = [celery_scan_page.s(pattern_name, next_start.isoformat(), next_end.isoformat(), page)
-                 for page in range(1, MAX_PAGES + 1)]
+        tasks = [
+            celery_scan_page.s(
+                pattern_name,
+                next_start.isoformat(),
+                next_end.isoformat(),
+                page
+            )
+            for page in range(1, MAX_PAGES + 1)
+        ]
         chord(tasks)(dispatch_window.s(pattern_name, next_start.isoformat(), next_end.isoformat(), now_str))
     else:
         logger.info(f"All windows complete for pattern: {pattern_name}")
@@ -241,8 +254,15 @@ def dispatch_all_scans():
     for pattern_name in PATTERN_SEARCH_TERMS.keys():
         start_time = now - timedelta(days=DEFAULT_DAYS)
         window_end = min(start_time + timedelta(hours=WINDOW_HOURS), now)
-        tasks = [celery_scan_page.s(pattern_name, start_time.isoformat(), window_end.isoformat(), page)
-                 for page in range(1, MAX_PAGES + 1)]
+        tasks = [
+            celery_scan_page.s(
+                pattern_name,
+                start_time.isoformat(),
+                window_end.isoformat(),
+                page
+            )
+            for page in range(1, MAX_PAGES + 1)
+        ]
         chord(tasks)(dispatch_window.s(pattern_name, start_time.isoformat(), window_end.isoformat(), now_str))
 # --- End Task Dispatching ---
 
