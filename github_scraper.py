@@ -216,8 +216,7 @@ def dispatch_all_scans():
     tasks = []
     now = datetime.utcnow()
     for pattern_name in PATTERN_SEARCH_TERMS.keys():
-        # Get last scanned time for the pattern.
-        # For simplicity, use default start time (e.g., 30 days ago).
+        # For simplicity, start scanning DEFAULT_DAYS ago.
         start_time = now - timedelta(days=DEFAULT_DAYS)
         current_time = start_time
         while current_time < now:
