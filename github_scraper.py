@@ -154,7 +154,7 @@ async def run_scan_for_pattern(pattern_name):
     results = []
     for page in range(1, MAX_PAGES + 1):
         query = search_term + filter_str
-        url = f"https://api.github.com/search/code?q={query}&per_page=100&page={page}"
+        url = f"https://api.github.com/search/code?q={query}&per_page=1000&page={page}"
         try:
             data = await fetch_github(url)
             items = data.get("items", [])
