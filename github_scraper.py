@@ -5,7 +5,7 @@ import os
 import re
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from tenacity import retry, wait_exponential, stop_after_attempt
 from celery import Celery, chord
 from flask import Flask
@@ -20,6 +20,8 @@ BROKER_URL = os.environ.get("BROKER_URL", "redis://localhost:6379/0")
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
 # Increase MAX_PAGES as needed to extract more keys.
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
+# Use an hourly window; configure via environment variable.
+WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "1"))
 # --- End Configuration ---
 
 # --- Logging Setup ---
@@ -149,31 +151,51 @@ async def run_scan_for_pattern(pattern_name):
     pool = await asyncpg.create_pool(dsn=DB_DSN)
     await setup_db(pool)
 
+    # Determine the time window for scanning.
     last_scanned = await get_last_scanned(pool)
-    filter_str = f" pushed:>{last_scanned.isoformat()}" if last_scanned else ""
-    results = []
-    for page in range(1, MAX_PAGES + 1):
-        query = search_term + filter_str
-        url = f"https://api.github.com/search/code?q={query}&per_page=1000&page={page}"
-        try:
-            data = await fetch_github(url)
-            items = data.get("items", [])
-            if not items:
-                break
-            results.extend(items)
-        except Exception as e:
-            logger.error(f"Error fetching GitHub items for pattern {pattern_name}: {e}")
-            break
-        await asyncio.sleep(2)
-    
+    if last_scanned:
+        start_time = last_scanned
+    else:
+        # If no previous scan, start from a default time (e.g., 30 days ago).
+        start_time = datetime.utcnow() - timedelta(days=30)
+    end_time = datetime.utcnow()
+
+    current_time = start_time
     total_unique = 0
-    tasks = [process_item(item, pool) for item in results]
-    counts = await asyncio.gather(*tasks, return_exceptions=True)
-    for count in counts:
-        if isinstance(count, Exception):
-            logger.error(f"Error in processing task: {count}")
-        else:
-            total_unique += count
+
+    # Iterate over time windows (using an hourly window).
+    while current_time < end_time:
+        window_end = min(current_time + timedelta(hours=WINDOW_HOURS), end_time)
+        # Use GitHub's pushed range syntax.
+        time_filter = f" pushed:{current_time.isoformat()}..{window_end.isoformat()}"
+        logger.info(f"Scanning window: {current_time.isoformat()} to {window_end.isoformat()}")
+
+        results = []
+        for page in range(1, MAX_PAGES + 1):
+            query = search_term + time_filter
+            url = f"https://api.github.com/search/code?q={query}&per_page=1000&page={page}"
+            try:
+                data = await fetch_github(url)
+                items = data.get("items", [])
+                if not items:
+                    break
+                results.extend(items)
+            except Exception as e:
+                logger.error(f"Error fetching GitHub items for pattern {pattern_name} in window {time_filter}: {e}")
+                break
+            await asyncio.sleep(2)
+        
+        # Process the results from this time window.
+        tasks = [process_item(item, pool) for item in results]
+        counts = await asyncio.gather(*tasks, return_exceptions=True)
+        for count in counts:
+            if isinstance(count, Exception):
+                logger.error(f"Error in processing task: {count}")
+            else:
+                total_unique += count
+
+        current_time = window_end
+
     logger.info(f"Scan complete for {pattern_name}. Total unique keys saved: {total_unique}")
     await update_last_scanned(pool, datetime.utcnow())
     await pool.close()
@@ -183,64 +205,4 @@ async def process_item(item, pool):
     file_path = item["path"]
     logger.info(f"Processing file: {repo_url}/{file_path}")
     download_url = item.get("download_url")
-    file_url = download_url if download_url else item.get("html_url")
-    if not file_url:
-        logger.info(f"No file URL for {repo_url}/{file_path}")
-        return 0
-    try:
-        content = await fetch_file_content(file_url)
-    except Exception as e:
-        logger.error(f"Error fetching file {file_url}: {e}")
-        return 0
-    leaked_keys = []
-    for key_type, compiled in COMPILED_PATTERNS.items():
-        matches = compiled.findall(content)
-        for match in matches:
-            leaked_keys.append((key_type, match))
-    if not leaked_keys:
-        logger.info(f"No keys found in {file_url}")
-        return 0
-    unique_count = 0
-    async with pool.acquire() as conn:
-        for key_type, leaked_key in leaked_keys:
-            row = await conn.fetchrow(
-                "SELECT id FROM leaked_keys WHERE repo_url=$1 AND file_path=$2 AND leaked_key=$3",
-                repo_url, file_path, leaked_key
-            )
-            if row:
-                logger.info(f"Key already exists for {repo_url}/{file_path}")
-                continue
-            row = await conn.fetchrow(
-                "INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key) VALUES ($1, $2, $3, $4) RETURNING id",
-                repo_url, file_path, key_type, leaked_key
-            )
-            unique_count += 1
-            logger.info(f"Unique key: {leaked_key[:10]}... | Inserted ID: {row['id']}")
-    return unique_count
-# --- End GitHub Search & Processing ---
-
-# --- Celery Tasks ---
-
-# Task to scan a single API pattern.
-@celery.task(name="celery_run_scan_for_pattern")
-def celery_run_scan_for_pattern(pattern_name):
-    asyncio.run(run_scan_for_pattern(pattern_name))
-
-# Callback task to be executed once all scan tasks complete.
-@celery.task(name="all_scans_completed")
-def all_scans_completed(results):
-    logger.info("All scan tasks completed. Results: %s", results)
-
-# Master task to dispatch scan tasks for all patterns using a Celery chord.
-@celery.task(name="dispatch_all_scans")
-def dispatch_all_scans():
-    tasks = []
-    for pattern_name in PATTERN_SEARCH_TERMS.keys():
-        queue_name = f"scan_{pattern_name.lower().replace(' ', '_')}"
-        tasks.append(celery_run_scan_for_pattern.s(pattern_name).set(queue=queue_name))
-    # Create a chord that executes the callback when all tasks complete.
-    chord(tasks)(all_scans_completed.s())
-# --- End Celery Tasks ---
-
-if __name__ == "__main__":
-    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    file_url = download_ur
