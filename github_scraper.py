@@ -11,18 +11,13 @@ from celery import Celery
 from flask import Flask
 
 # --- Configuration Management ---
-# These settings are loaded from environment variables.
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-# Build a DSN for Postgres; you can also supply a complete DATABASE_URL
 DB_DSN = os.environ.get("DATABASE_URL") or (
     f"postgresql://{os.environ.get('DB_USER')}:{os.environ.get('DB_PASSWORD')}"
     f"@{os.environ.get('DB_HOST')}:{os.environ.get('DB_PORT', '5432')}/{os.environ.get('DB_NAME')}"
 )
-# Broker URL for Celery (e.g. Redis)
 BROKER_URL = os.environ.get("BROKER_URL", "redis://localhost:6379/0")
-# HTTP timeout in seconds
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
-# Maximum pages to scan per search term
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
 # --- End Configuration ---
 
@@ -35,12 +30,29 @@ logger = logging.getLogger(__name__)
 # --- End Logging Setup ---
 
 # --- Celery Setup ---
-celery = Celery("scan_tasks", broker=BROKER_URL)
+CELERY_RESULT_BACKEND = BROKER_URL  # using Redis as the backend
+celery = Celery("scan_tasks", broker=BROKER_URL, backend=CELERY_RESULT_BACKEND)
+celery.conf.update(
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone="UTC",
+    enable_utc=True,
+)
 # --- End Celery Setup ---
 
-# --- Flask App Setup ---
-flask_app = Flask(__name__)
-# --- End Flask App Setup ---
+def create_flask_app():
+    """Factory function to create and configure the Flask app."""
+    app = Flask(__name__)
+
+    @app.route("/", methods=["GET"])
+    def index():
+        celery_run_scan.delay()  # trigger the background scan
+        return "Async scan started. Check logs for output.\n"
+
+    return app
+
+flask_app = create_flask_app()
 
 # --- Precompile API Key Patterns ---
 API_PATTERNS = {
@@ -57,7 +69,6 @@ COMPILED_PATTERNS = {k: re.compile(v) for k, v in API_PATTERNS.items()}
 # --- Database Table Setup Functions ---
 async def setup_db(pool):
     async with pool.acquire() as conn:
-        # Create table to store keys.
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS leaked_keys (
                 id SERIAL PRIMARY KEY,
@@ -69,7 +80,6 @@ async def setup_db(pool):
                 notified BOOLEAN DEFAULT FALSE
             );
         """)
-        # Create table to cache the last scan timestamp.
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS scan_cache (
                 id SERIAL PRIMARY KEY,
@@ -94,7 +104,6 @@ async def fetch_github(url):
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers, timeout=HTTP_TIMEOUT) as response:
-            # If rate limited, sleep and let tenacity retry.
             if response.status == 403:
                 logger.warning("Rate limited by GitHub, sleeping for 60 seconds...")
                 await asyncio.sleep(60)
@@ -122,12 +131,8 @@ async def fetch_file_content(url):
 async def search_github(pool, per_page=100, max_pages=MAX_PAGES):
     search_terms = ["OPEN_API_KEY=sk-", "AKIA", "AIza", "sk_live_", "xoxb", "ghp_"]
     results = []
-    # Retrieve last scanned timestamp for incremental scanning
     last_scanned = await get_last_scanned(pool)
-    filter_str = ""
-    if last_scanned:
-        # GitHub search qualifier to filter by push date (ISO 8601)
-        filter_str = f" pushed:>{last_scanned.isoformat()}"
+    filter_str = f" pushed:>{last_scanned.isoformat()}" if last_scanned else ""
     for term in search_terms:
         for page in range(1, max_pages + 1):
             query = term + filter_str
@@ -141,7 +146,7 @@ async def search_github(pool, per_page=100, max_pages=MAX_PAGES):
             except Exception as e:
                 logger.error(f"Error fetching GitHub items: {e}")
                 break
-            await asyncio.sleep(2)  # slight delay to avoid spamming
+            await asyncio.sleep(2)
     return results
 
 async def process_item(item, pool):
@@ -186,7 +191,6 @@ async def process_item(item, pool):
 
 async def run_async_scan():
     logger.info("Starting async scan...")
-    # Create a connection pool
     pool = await asyncpg.create_pool(dsn=DB_DSN)
     await setup_db(pool)
     results = await search_github(pool)
@@ -215,12 +219,6 @@ def celery_run_scan():
     asyncio.run(run_async_scan())
 # --- End Celery Task ---
 
-# --- Flask Endpoint ---
-@flask_app.route("/", methods=["GET"])
-def index():
-    celery_run_scan.delay()
-    return "Async scan started. Check logs for output.\n"
-# --- End Flask Endpoint ---
-
 if __name__ == "__main__":
+    # Start the Flask development server.
     flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
