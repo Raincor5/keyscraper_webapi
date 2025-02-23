@@ -3,11 +3,11 @@ import aiohttp
 import asyncpg
 import os
 import re
-import time
 import logging
 from datetime import datetime, timedelta
 from tenacity import retry, wait_exponential, stop_after_attempt
 from celery import Celery, chord
+from celery.signals import worker_process_init
 from flask import Flask
 
 # --- Configuration Management ---
@@ -45,8 +45,20 @@ celery.conf.update(
 )
 # --- End Celery Setup ---
 
+# --- Global Connection Pool ---
+global_pool = None
+
+@worker_process_init.connect
+def init_worker(**kwargs):
+    global global_pool
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    global_pool = loop.run_until_complete(asyncpg.create_pool(dsn=DB_DSN))
+    loop.run_until_complete(setup_db(global_pool))
+    logger.info("Worker process initialized and connection pool created.")
+
+# --- Flask App ---
 def create_flask_app():
-    """Factory function to create and configure the Flask app."""
     app = Flask(__name__)
     @app.route("/", methods=["GET"])
     def index():
@@ -157,8 +169,9 @@ def celery_scan_page(pattern_name, window_start_str, window_end_str, page):
         raise Exception(f"celery_scan_page failed for pattern {pattern_name} page {page}: {str(e)}")
 
 async def scan_page(pattern_name, window_start, window_end, page):
-    pool = await asyncpg.create_pool(dsn=DB_DSN)
-    await setup_db(pool)
+    global global_pool
+    if not global_pool:
+        raise Exception("Global connection pool not initialized")
     search_term = PATTERN_SEARCH_TERMS.get(pattern_name)
     query = f"{search_term} pushed:{window_start.isoformat()}..{window_end.isoformat()}"
     url = f"https://api.github.com/search/code?q={query}&per_page={PER_PAGE}&page={page}"
@@ -166,15 +179,12 @@ async def scan_page(pattern_name, window_start, window_end, page):
         data = await fetch_github(url)
         items = data.get("items", [])
         if not items:
-            await pool.close()
             return 0
-        tasks = [process_item(item, pool) for item in items]
+        tasks = [process_item(item, global_pool) for item in items]
         counts = await asyncio.gather(*tasks, return_exceptions=True)
         total = sum(count for count in counts if not isinstance(count, Exception))
-        await pool.close()
         return total
     except Exception as e:
-        await pool.close()
         raise e
 # --- End Single Page Task ---
 
