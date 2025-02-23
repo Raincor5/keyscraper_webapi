@@ -18,11 +18,10 @@ DB_DSN = os.environ.get("DATABASE_URL") or (
 )
 BROKER_URL = os.environ.get("BROKER_URL", "redis://localhost:6379/0")
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
-# Increase MAX_PAGES as needed to extract more keys.
+# Lower PER_PAGE if needed to reduce memory load.
+PER_PAGE = int(os.environ.get("PER_PAGE", "200"))
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
-# Use an hourly window; configure via environment variable.
 WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "1"))
-# Default period (e.g., 30 days) if no previous scan.
 DEFAULT_DAYS = int(os.environ.get("DEFAULT_DAYS", "30"))
 # --- End Configuration ---
 
@@ -35,7 +34,7 @@ logger = logging.getLogger(__name__)
 # --- End Logging Setup ---
 
 # --- Celery Setup ---
-CELERY_RESULT_BACKEND = BROKER_URL  # using Redis as the backend
+CELERY_RESULT_BACKEND = BROKER_URL
 celery = Celery("scan_tasks", broker=BROKER_URL, backend=CELERY_RESULT_BACKEND)
 celery.conf.update(
     task_serializer="json",
@@ -47,12 +46,11 @@ celery.conf.update(
 # --- End Celery Setup ---
 
 def create_flask_app():
-    """Factory function to create and configure the Flask app."""
     app = Flask(__name__)
     @app.route("/", methods=["GET"])
     def index():
         dispatch_all_scans.delay()
-        return "Dispatched individual scan tasks. Check logs for output.\n"
+        return "Dispatched scan tasks. Check logs for output.\n"
     return app
 
 flask_app = create_flask_app()
@@ -110,7 +108,7 @@ async def update_last_scanned(pool, timestamp):
         await conn.execute("INSERT INTO scan_cache (last_scanned) VALUES ($1);", timestamp)
 # --- End DB Setup Functions ---
 
-# --- HTTP Helpers with Retry & Rate Limit Handling ---
+# --- HTTP Helpers ---
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 async def fetch_github(url):
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
@@ -151,7 +149,7 @@ async def scan_page(pattern_name, window_start, window_end, page):
     await setup_db(pool)
     search_term = PATTERN_SEARCH_TERMS.get(pattern_name)
     query = f"{search_term} pushed:{window_start.isoformat()}..{window_end.isoformat()}"
-    url = f"https://api.github.com/search/code?q={query}&per_page=1000&page={page}"
+    url = f"https://api.github.com/search/code?q={query}&per_page={PER_PAGE}&page={page}"
     try:
         data = await fetch_github(url)
         items = data.get("items", [])
@@ -210,33 +208,36 @@ async def process_item(item, pool):
     return unique_count
 # --- End File Processing ---
 
-# --- Dispatching Tasks Across Workers ---
+# --- Dispatching Tasks in Batches (Window Chain) ---
+@celery.task(name="dispatch_window")
+def dispatch_window(_, pattern_name, window_start_str, window_end_str, now_str):
+    """
+    Callback for a window batch.
+    The '_' argument holds the chord result (unused).
+    If the current window_end is before 'now', schedule the next window.
+    """
+    window_end = datetime.fromisoformat(window_end_str)
+    now = datetime.fromisoformat(now_str)
+    logger.info(f"Completed window for {pattern_name}: {window_start_str} to {window_end_str}")
+    if window_end < now:
+        next_start = window_end
+        next_end = min(next_start + timedelta(hours=WINDOW_HOURS), now)
+        tasks = [celery_scan_page.s(pattern_name, next_start.isoformat(), next_end.isoformat(), page)
+                 for page in range(1, MAX_PAGES + 1)]
+        chord(tasks)(dispatch_window.s(pattern_name, next_start.isoformat(), next_end.isoformat(), now_str))
+    else:
+        logger.info(f"All windows complete for pattern: {pattern_name}")
+
 @celery.task(name="dispatch_all_scans")
 def dispatch_all_scans():
-    tasks = []
     now = datetime.utcnow()
+    now_str = now.isoformat()
     for pattern_name in PATTERN_SEARCH_TERMS.keys():
-        # For simplicity, start scanning DEFAULT_DAYS ago.
         start_time = now - timedelta(days=DEFAULT_DAYS)
-        current_time = start_time
-        while current_time < now:
-            window_end = min(current_time + timedelta(hours=WINDOW_HOURS), now)
-            for page in range(1, MAX_PAGES + 1):
-                tasks.append(
-                    celery_scan_page.s(
-                        pattern_name,
-                        current_time.isoformat(),
-                        window_end.isoformat(),
-                        page
-                    )
-                )
-            current_time = window_end
-    # Use a chord to execute a callback once all page tasks are done.
-    chord(tasks)(all_scans_completed.s())
-    
-@celery.task(name="all_scans_completed")
-def all_scans_completed(results):
-    logger.info("All scan tasks completed. Results: %s", results)
+        window_end = min(start_time + timedelta(hours=WINDOW_HOURS), now)
+        tasks = [celery_scan_page.s(pattern_name, start_time.isoformat(), window_end.isoformat(), page)
+                 for page in range(1, MAX_PAGES + 1)]
+        chord(tasks)(dispatch_window.s(pattern_name, start_time.isoformat(), window_end.isoformat(), now_str))
 # --- End Task Dispatching ---
 
 if __name__ == "__main__":
