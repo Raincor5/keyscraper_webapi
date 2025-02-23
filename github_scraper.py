@@ -47,14 +47,25 @@ def create_flask_app():
 
     @app.route("/", methods=["GET"])
     def index():
-        celery_run_scan.delay()  # trigger the background scan
-        return "Async scan started. Check logs for output.\n"
+        # Dispatch scan tasks for each API pattern
+        dispatch_all_scans.delay()
+        return "Dispatched individual scan tasks. Check logs for output.\n"
 
     return app
 
 flask_app = create_flask_app()
 
-# --- Precompile API Key Patterns ---
+# --- API Patterns and Search Terms ---
+# Mapping API pattern names to their GitHub search term.
+PATTERN_SEARCH_TERMS = {
+    "OpenAI": "OPEN_API_KEY=sk-",
+    "AWS": "AKIA",
+    "Google API": "AIza",
+    "Stripe": "sk_live_",
+    "Slack": "xoxb",
+    "GitHub Token": "ghp_",
+}
+
 API_PATTERNS = {
     "OpenAI": r"OPEN_API_KEY=sk-[a-zA-Z0-9]{48}",
     "AWS": r"AKIA[0-9A-Z]{16}",
@@ -64,7 +75,7 @@ API_PATTERNS = {
     "GitHub Token": r"ghp_[0-9a-zA-Z]{36}",
 }
 COMPILED_PATTERNS = {k: re.compile(v) for k, v in API_PATTERNS.items()}
-# --- End Patterns ---
+# --- End API Patterns ---
 
 # --- Database Table Setup Functions ---
 async def setup_db(pool):
@@ -127,27 +138,45 @@ async def fetch_file_content(url):
             return await response.text()
 # --- End HTTP Helpers ---
 
-# --- GitHub Search & Processing ---
-async def search_github(pool, per_page=100, max_pages=MAX_PAGES):
-    search_terms = ["OPEN_API_KEY=sk-", "AKIA", "AIza", "sk_live_", "xoxb", "ghp_"]
-    results = []
+# --- GitHub Search & Processing for a Single Pattern ---
+async def run_scan_for_pattern(pattern_name):
+    search_term = PATTERN_SEARCH_TERMS.get(pattern_name)
+    if not search_term:
+        logger.error(f"No search term defined for pattern: {pattern_name}")
+        return
+
+    logger.info(f"Starting async scan for pattern: {pattern_name} ({search_term})")
+    pool = await asyncpg.create_pool(dsn=DB_DSN)
+    await setup_db(pool)
+
     last_scanned = await get_last_scanned(pool)
     filter_str = f" pushed:>{last_scanned.isoformat()}" if last_scanned else ""
-    for term in search_terms:
-        for page in range(1, max_pages + 1):
-            query = term + filter_str
-            url = f"https://api.github.com/search/code?q={query}&per_page={per_page}&page={page}"
-            try:
-                data = await fetch_github(url)
-                items = data.get("items", [])
-                if not items:
-                    break
-                results.extend(items)
-            except Exception as e:
-                logger.error(f"Error fetching GitHub items: {e}")
+    results = []
+    for page in range(1, MAX_PAGES + 1):
+        query = search_term + filter_str
+        url = f"https://api.github.com/search/code?q={query}&per_page=100&page={page}"
+        try:
+            data = await fetch_github(url)
+            items = data.get("items", [])
+            if not items:
                 break
-            await asyncio.sleep(2)
-    return results
+            results.extend(items)
+        except Exception as e:
+            logger.error(f"Error fetching GitHub items for pattern {pattern_name}: {e}")
+            break
+        await asyncio.sleep(2)
+    
+    total_unique = 0
+    tasks = [process_item(item, pool) for item in results]
+    counts = await asyncio.gather(*tasks, return_exceptions=True)
+    for count in counts:
+        if isinstance(count, Exception):
+            logger.error(f"Error in processing task: {count}")
+        else:
+            total_unique += count
+    logger.info(f"Scan complete for {pattern_name}. Total unique keys saved: {total_unique}")
+    await update_last_scanned(pool, datetime.utcnow())
+    await pool.close()
 
 async def process_item(item, pool):
     repo_url = item["repository"]["html_url"]
@@ -188,37 +217,23 @@ async def process_item(item, pool):
             unique_count += 1
             logger.info(f"Unique key: {leaked_key[:10]}... | Inserted ID: {row['id']}")
     return unique_count
+# --- End GitHub Search & Processing ---
 
-async def run_async_scan():
-    logger.info("Starting async scan...")
-    pool = await asyncpg.create_pool(dsn=DB_DSN)
-    await setup_db(pool)
-    results = await search_github(pool)
-    logger.info(f"Fetched {len(results)} GitHub results.")
-    if not results:
-        logger.info("No new results. Scan complete.")
-        await update_last_scanned(pool, datetime.utcnow())
-        await pool.close()
-        return
-    total_unique = 0
-    tasks = [process_item(item, pool) for item in results]
-    counts = await asyncio.gather(*tasks, return_exceptions=True)
-    for count in counts:
-        if isinstance(count, Exception):
-            logger.error(f"Error in processing task: {count}")
-        else:
-            total_unique += count
-    logger.info(f"Scan complete. Total unique keys saved: {total_unique}")
-    await update_last_scanned(pool, datetime.utcnow())
-    await pool.close()
-# --- End GitHub Processing ---
+# --- Celery Tasks ---
 
-# --- Celery Task ---
-@celery.task
-def celery_run_scan():
-    asyncio.run(run_async_scan())
-# --- End Celery Task ---
+# Task to scan a single API pattern.
+@celery.task(name="celery_run_scan_for_pattern")
+def celery_run_scan_for_pattern(pattern_name):
+    asyncio.run(run_scan_for_pattern(pattern_name))
+
+# Master task to dispatch scan tasks for all patterns.
+@celery.task(name="dispatch_all_scans")
+def dispatch_all_scans():
+    for pattern_name in PATTERN_SEARCH_TERMS.keys():
+        # Route each task to its dedicated queue.
+        queue_name = f"scan_{pattern_name.lower().replace(' ', '_')}"
+        celery_run_scan_for_pattern.apply_async(args=[pattern_name], queue=queue_name)
+# --- End Celery Tasks ---
 
 if __name__ == "__main__":
-    # Start the Flask development server.
     flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
