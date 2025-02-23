@@ -18,11 +18,13 @@ DB_DSN = os.environ.get("DATABASE_URL") or (
 )
 BROKER_URL = os.environ.get("BROKER_URL", "redis://localhost:6379/0")
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
-# Lower PER_PAGE if needed to reduce memory load.
 PER_PAGE = int(os.environ.get("PER_PAGE", "200"))
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
-WINDOW_HOURS = int(os.environ.get("WINDOW_HOURS", "1"))
+# Use a smaller window in minutes; you can adjust this (e.g., 15 minutes)
+WINDOW_MINUTES = int(os.environ.get("WINDOW_MINUTES", "15"))
 DEFAULT_DAYS = int(os.environ.get("DEFAULT_DAYS", "30"))
+# Minimum window size (in minutes) below which we won't subdivide further.
+MIN_WINDOW_MINUTES = int(os.environ.get("MIN_WINDOW_MINUTES", "1"))
 # --- End Configuration ---
 
 # --- Logging Setup ---
@@ -121,6 +123,10 @@ async def update_last_scanned(pool, timestamp):
         await conn.execute("INSERT INTO scan_cache (last_scanned) VALUES ($1);", timestamp)
 # --- End DB Setup Functions ---
 
+# --- Custom Exception ---
+class GitHubLimitExceeded(Exception):
+    pass
+
 # --- HTTP Helpers ---
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 async def fetch_github(url):
@@ -130,8 +136,8 @@ async def fetch_github(url):
             if response.status == 422:
                 text = await response.text()
                 if "Cannot access beyond the first 1000 results" in text:
-                    logger.warning("GitHub API error 422: Cannot access beyond the first 1000 results. Returning empty result.")
-                    return {"items": []}
+                    logger.warning("GitHub API error 422: Cannot access beyond the first 1000 results.")
+                    raise GitHubLimitExceeded(text)
                 else:
                     raise Exception(f"GitHub API error {response.status}: {text}")
             if response.status == 403:
@@ -157,36 +163,46 @@ async def fetch_file_content(url):
             return await response.text()
 # --- End HTTP Helpers ---
 
-# --- Task to Scan a Single Page in a Time Window for a Given Pattern ---
-@celery.task(name="celery_scan_page")
-def celery_scan_page(pattern_name, window_start_str, window_end_str, page):
+# --- Recursive Scan Function ---
+async def scan_window(pattern_name, window_start, window_end):
+    """Scan a time window for the given pattern, paginating through results.
+       If GitHubLimitExceeded is raised, subdivide the window and aggregate."""
+    total = 0
+    for page in range(1, MAX_PAGES + 1):
+        query = f"{PATTERN_SEARCH_TERMS[pattern_name]} pushed:{window_start.isoformat()}..{window_end.isoformat()}"
+        url = f"https://api.github.com/search/code?q={query}&per_page={PER_PAGE}&page={page}"
+        try:
+            data = await fetch_github(url)
+        except GitHubLimitExceeded as gle:
+            # Subdivide the window if possible.
+            duration = window_end - window_start
+            if duration >= timedelta(minutes=MIN_WINDOW_MINUTES * 2):
+                mid = window_start + duration / 2
+                logger.info(f"Subdividing window for {pattern_name}: {window_start.isoformat()} to {window_end.isoformat()}")
+                left = await scan_window(pattern_name, window_start, mid)
+                right = await scan_window(pattern_name, mid, window_end)
+                return left + right
+            else:
+                logger.warning(f"Window too small to subdivide further for {pattern_name}: {window_start.isoformat()} to {window_end.isoformat()}")
+                return 0
+        items = data.get("items", [])
+        if not items:
+            break  # no more results for this page
+        tasks = [process_item(item, global_pool) for item in items]
+        counts = await asyncio.gather(*tasks, return_exceptions=True)
+        total += sum(count for count in counts if not isinstance(count, Exception))
+    return total
+
+# --- Celery Task for a Single Window ---
+@celery.task(name="celery_scan_window")
+def celery_scan_window(pattern_name, window_start_str, window_end_str):
     window_start = datetime.fromisoformat(window_start_str)
     window_end = datetime.fromisoformat(window_end_str)
     try:
-        result = asyncio.run(scan_page(pattern_name, window_start, window_end, page))
+        result = asyncio.run(scan_window(pattern_name, window_start, window_end))
         return result
     except Exception as e:
-        raise Exception(f"celery_scan_page failed for pattern {pattern_name} page {page}: {str(e)}")
-
-async def scan_page(pattern_name, window_start, window_end, page):
-    global global_pool
-    if not global_pool:
-        raise Exception("Global connection pool not initialized")
-    search_term = PATTERN_SEARCH_TERMS.get(pattern_name)
-    query = f"{search_term} pushed:{window_start.isoformat()}..{window_end.isoformat()}"
-    url = f"https://api.github.com/search/code?q={query}&per_page={PER_PAGE}&page={page}"
-    try:
-        data = await fetch_github(url)
-        items = data.get("items", [])
-        if not items:
-            return 0
-        tasks = [process_item(item, global_pool) for item in items]
-        counts = await asyncio.gather(*tasks, return_exceptions=True)
-        total = sum(count for count in counts if not isinstance(count, Exception))
-        return total
-    except Exception as e:
-        raise e
-# --- End Single Page Task ---
+        raise Exception(f"celery_scan_window failed for pattern {pattern_name} window {window_start_str} to {window_end_str}: {str(e)}")
 
 # --- Task to Process an Individual File ---
 async def process_item(item, pool):
@@ -235,7 +251,6 @@ async def process_item(item, pool):
 def dispatch_window(_, pattern_name, window_start_str, window_end_str, now_str):
     """
     Callback for a window batch.
-    The '_' argument holds the chord result (unused).
     If the current window_end is before 'now', schedule the next window.
     """
     window_end = datetime.fromisoformat(window_end_str)
@@ -243,16 +258,9 @@ def dispatch_window(_, pattern_name, window_start_str, window_end_str, now_str):
     logger.info(f"Completed window for {pattern_name}: {window_start_str} to {window_end_str}")
     if window_end < now:
         next_start = window_end
-        next_end = min(next_start + timedelta(hours=WINDOW_HOURS), now)
-        tasks = [
-            celery_scan_page.s(
-                pattern_name,
-                next_start.isoformat(),
-                next_end.isoformat(),
-                page
-            )
-            for page in range(1, MAX_PAGES + 1)
-        ]
+        next_end = min(next_start + timedelta(minutes=WINDOW_MINUTES), now)
+        # Schedule the next window for this pattern.
+        tasks = [celery_scan_window.s(pattern_name, next_start.isoformat(), next_end.isoformat())]
         chord(tasks)(dispatch_window.s(pattern_name, next_start.isoformat(), next_end.isoformat(), now_str))
     else:
         logger.info(f"All windows complete for pattern: {pattern_name}")
@@ -263,16 +271,8 @@ def dispatch_all_scans():
     now_str = now.isoformat()
     for pattern_name in PATTERN_SEARCH_TERMS.keys():
         start_time = now - timedelta(days=DEFAULT_DAYS)
-        window_end = min(start_time + timedelta(hours=WINDOW_HOURS), now)
-        tasks = [
-            celery_scan_page.s(
-                pattern_name,
-                start_time.isoformat(),
-                window_end.isoformat(),
-                page
-            )
-            for page in range(1, MAX_PAGES + 1)
-        ]
+        window_end = min(start_time + timedelta(minutes=WINDOW_MINUTES), now)
+        tasks = [celery_scan_window.s(pattern_name, start_time.isoformat(), window_end.isoformat())]
         chord(tasks)(dispatch_window.s(pattern_name, start_time.isoformat(), window_end.isoformat(), now_str))
 # --- End Task Dispatching ---
 
