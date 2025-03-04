@@ -6,7 +6,7 @@ import re
 import logging
 from datetime import datetime, timedelta, timezone
 from tenacity import retry, wait_exponential, stop_after_attempt
-from celery import Celery, chord
+from celery import Celery, chain, chord
 from celery.signals import worker_process_init, worker_process_shutdown
 from flask import Flask
 from aiolimiter import AsyncLimiter
@@ -35,6 +35,8 @@ logger = logging.getLogger(__name__)
 # --- End Logging Setup ---
 
 # --- Celery Setup ---
+# Note: We route scanning tasks and scheduling tasks to one set of queues,
+# and database-storage tasks to a different queue.
 CELERY_RESULT_BACKEND = BROKER_URL
 celery = Celery("scan_tasks", broker=BROKER_URL, backend=CELERY_RESULT_BACKEND)
 celery.conf.update(
@@ -46,6 +48,7 @@ celery.conf.update(
     worker_prefetch_multiplier=1,
     task_routes={
         'celery_scan_window': {'queue': 'github_scan'},
+        'store_matches': {'queue': 'db_store'},
         'dispatch_window': {'queue': 'window_dispatch'},
         'dispatch_all_scans': {'queue': 'dispatcher'},
     },
@@ -59,12 +62,16 @@ worker_loop = None
 @worker_process_init.connect
 def init_worker(**kwargs):
     global global_pool, worker_loop
-    # Create and set a new event loop for this worker process
+    # Create and set a dedicated event loop for this worker process
     worker_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(worker_loop)
-    # Optionally, configure pool parameters (like max inactive lifetime)
     global_pool = worker_loop.run_until_complete(
-        asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=10, max_inactive_connection_lifetime=300)
+        asyncpg.create_pool(
+            dsn=DB_DSN,
+            min_size=1,
+            max_size=10,
+            max_inactive_connection_lifetime=300
+        )
     )
     worker_loop.run_until_complete(setup_db(global_pool))
     logger.info("Worker process initialized and connection pool created.")
@@ -83,7 +90,6 @@ def create_flask_app():
     def index():
         dispatch_all_scans.delay()
         return "Dispatched scan tasks. Check logs for output.\n"
-    app.add_url_rule("/", "index", index)
     return app
 
 flask_app = create_flask_app()
@@ -192,9 +198,39 @@ async def fetch_file_content(url):
             return await response.text()
 # --- End HTTP Helpers ---
 
-# --- Recursive Scan Function ---
+# --- Worker Stage 1: Scanning and Finding Matches ---
+# Instead of processing items to immediately write to DB, we extract match info.
+async def find_matches(item):
+    repo_url = item["repository"]["html_url"]
+    file_path = item["path"]
+    logger.info(f"Scanning file: {repo_url}/{file_path}")
+    download_url = item.get("download_url")
+    file_url = download_url if download_url else item.get("html_url")
+    if not file_url:
+        logger.info(f"No file URL for {repo_url}/{file_path}")
+        return []
+    try:
+        content = await fetch_file_content(file_url)
+    except Exception as e:
+        logger.error(f"Error fetching file {file_url}: {e}")
+        return []
+    matches_found = []
+    for key_type, compiled in COMPILED_PATTERNS.items():
+        for match in compiled.findall(content):
+            matches_found.append({
+                "repo_url": repo_url,
+                "file_path": file_path,
+                "key_type": key_type,
+                "leaked_key": match,
+                "detected_at": datetime.now(timezone.utc).isoformat()
+            })
+    if not matches_found:
+        logger.info(f"No keys found in {file_url}")
+    return matches_found
+
+# Modified scan_window returns a list of match dictionaries.
 async def scan_window(pattern_name, window_start, window_end):
-    total = 0
+    all_matches = []
     for page in range(1, MAX_PAGES + 1):
         query = f"{PATTERN_SEARCH_TERMS[pattern_name]} pushed:{window_start.isoformat()}..{window_end.isoformat()}"
         url = f"https://api.github.com/search/code?q={query}&per_page={PER_PAGE}&page={page}"
@@ -210,79 +246,77 @@ async def scan_window(pattern_name, window_start, window_end):
                 return left + right
             else:
                 logger.warning(f"Window too small to subdivide for {pattern_name}: {window_start.isoformat()} to {window_end.isoformat()}")
-                return 0
+                return all_matches
         items = data.get("items", [])
         if not items:
             break
-        tasks = [process_item(item, global_pool) for item in items]
-        counts = await asyncio.gather(*tasks, return_exceptions=True)
-        total += sum(count for count in counts if not isinstance(count, Exception))
-    return total
+        # Instead of processing and inserting here, we only extract matches.
+        tasks = [find_matches(item) for item in items]
+        page_matches_lists = await asyncio.gather(*tasks, return_exceptions=True)
+        for m in page_matches_lists:
+            if not isinstance(m, Exception):
+                all_matches.extend(m)
+    return all_matches
 
-# --- Celery Task for a Single Window ---
+# Celery task for scanning a window returns a list of match dictionaries.
 @celery.task(name="celery_scan_window", queue="github_scan")
 def celery_scan_window(pattern_name, window_start_str, window_end_str):
     window_start = datetime.fromisoformat(window_start_str)
     window_end = datetime.fromisoformat(window_end_str)
     try:
-        # Use the dedicated worker_loop from initialization
-        result = worker_loop.run_until_complete(scan_window(pattern_name, window_start, window_end))
+        matches = worker_loop.run_until_complete(scan_window(pattern_name, window_start, window_end))
+        return matches  # This is a list (possibly empty) of match dictionaries.
+    except Exception as e:
+        logger.error(f"celery_scan_window failed for {pattern_name} window {window_start_str} to {window_end_str}: {str(e)}")
+        # On error, return an empty list so that no matches are lost.
+        return []
+
+# --- Worker Stage 2: Storing Matches into the Database ---
+@celery.task(name="store_matches", queue="db_store")
+def store_matches(matches):
+    try:
+        result = worker_loop.run_until_complete(store_matches_async(matches))
         return result
     except Exception as e:
-        raise Exception(f"celery_scan_window failed for pattern {pattern_name} window {window_start_str} to {window_end_str}: {str(e)}")
+        logger.error(f"store_matches failed: {str(e)}")
+        return 0
 
-# --- Task to Process an Individual File ---
-async def process_item(item, pool):
-    repo_url = item["repository"]["html_url"]
-    file_path = item["path"]
-    logger.info(f"Processing file: {repo_url}/{file_path}")
-    download_url = item.get("download_url")
-    file_url = download_url if download_url else item.get("html_url")
-    if not file_url:
-        logger.info(f"No file URL for {repo_url}/{file_path}")
-        return 0
-    try:
-        content = await fetch_file_content(file_url)
-    except Exception as e:
-        logger.error(f"Error fetching file {file_url}: {e}")
-        return 0
-    leaked_keys = []
-    for key_type, compiled in COMPILED_PATTERNS.items():
-        matches = compiled.findall(content)
+async def store_matches_async(matches):
+    inserted = 0
+    async with global_pool.acquire() as conn:
         for match in matches:
-            leaked_keys.append((key_type, match))
-    if not leaked_keys:
-        logger.info(f"No keys found in {file_url}")
-        return 0
-    unique_count = 0
-    async with pool.acquire() as conn:
-        for key_type, leaked_key in leaked_keys:
             row = await conn.fetchrow(
                 "SELECT id FROM leaked_keys WHERE repo_url=$1 AND file_path=$2 AND leaked_key=$3",
-                repo_url, file_path, leaked_key
+                match["repo_url"], match["file_path"], match["leaked_key"]
             )
             if row:
-                logger.info(f"Key already exists for {repo_url}/{file_path}")
+                logger.info(f"Match already exists: {match['repo_url']}/{match['file_path']}")
                 continue
             row = await conn.fetchrow(
                 "INSERT INTO leaked_keys (repo_url, file_path, key_type, leaked_key) VALUES ($1, $2, $3, $4) RETURNING id",
-                repo_url, file_path, key_type, leaked_key
+                match["repo_url"], match["file_path"], match["key_type"], match["leaked_key"]
             )
-            unique_count += 1
-            logger.info(f"Unique key: {leaked_key[:10]}... | Inserted ID: {row['id']}")
-    return unique_count
-# --- End File Processing ---
+            inserted += 1
+            logger.info(f"Inserted match: {match['leaked_key'][:10]}... (ID: {row['id']})")
+    return inserted
 
 # --- Dispatching Tasks in Batches (Window Chain) ---
+# Now each window chain becomes a pipeline: scan then store.
 @celery.task(name="dispatch_window", queue="window_dispatch")
 def dispatch_window(_, pattern_name, window_start_str, window_end_str, now_str):
     window_end = datetime.fromisoformat(window_end_str)
     now = datetime.fromisoformat(now_str)
     logger.info(f"Completed window for {pattern_name}: {window_start_str} to {window_end_str}")
+    # Chain the scanning task with the storing task.
+    chain_result = chain(
+        celery_scan_window.s(pattern_name, window_start_str, window_end_str),
+        store_matches.s()
+    ).delay()
+    # Schedule the next window if needed.
     if window_end < now:
         next_start = window_end
         next_end = min(next_start + timedelta(minutes=WINDOW_MINUTES), now)
-        tasks = [celery_scan_window.s(pattern_name, next_start.isoformat(), next_end.isoformat())]
+        tasks = [chain(celery_scan_window.s(pattern_name, next_start.isoformat(), next_end.isoformat()) | store_matches.s())]
         chord(tasks)(dispatch_window.s(pattern_name, next_start.isoformat(), next_end.isoformat(), now_str))
     else:
         logger.info(f"All windows complete for pattern: {pattern_name}")
@@ -294,8 +328,15 @@ def dispatch_all_scans():
     for pattern_name in PATTERN_SEARCH_TERMS.keys():
         start_time = now - timedelta(days=DEFAULT_DAYS)
         window_end = min(start_time + timedelta(minutes=WINDOW_MINUTES), now)
-        tasks = [celery_scan_window.s(pattern_name, start_time.isoformat(), window_end.isoformat())]
-        chord(tasks)(dispatch_window.s(pattern_name, start_time.isoformat(), window_end.isoformat(), now_str))
+        # For each window, create a chain: scan then store.
+        chain_result = chain(
+            celery_scan_window.s(pattern_name, start_time.isoformat(), window_end.isoformat()),
+            store_matches.s()
+        ).delay()
+        # Then schedule subsequent windows via dispatch_window.
+        chord([chain(celery_scan_window.s(pattern_name, start_time.isoformat(), window_end.isoformat()) | store_matches.s())])(
+            dispatch_window.s(pattern_name, start_time.isoformat(), window_end.isoformat(), now_str)
+        )
 # --- End Task Dispatching ---
 
 if __name__ == "__main__":
