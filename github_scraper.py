@@ -4,10 +4,10 @@ import asyncpg
 import os
 import re
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from tenacity import retry, wait_exponential, stop_after_attempt
 from celery import Celery, chord
-from celery.signals import worker_process_init
+from celery.signals import worker_process_init, worker_process_shutdown
 from flask import Flask
 from aiolimiter import AsyncLimiter
 
@@ -21,10 +21,8 @@ BROKER_URL = os.environ.get("BROKER_URL", "redis://localhost:6379/0")
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "10"))
 PER_PAGE = int(os.environ.get("PER_PAGE", "200"))
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "5"))
-# Use a smaller window in minutes; you can adjust this (e.g., 15 minutes)
 WINDOW_MINUTES = int(os.environ.get("WINDOW_MINUTES", "15"))
 DEFAULT_DAYS = int(os.environ.get("DEFAULT_DAYS", "30"))
-# Minimum window size (in minutes) below which we won't subdivide further.
 MIN_WINDOW_MINUTES = int(os.environ.get("MIN_WINDOW_MINUTES", "1"))
 # --- End Configuration ---
 
@@ -45,7 +43,7 @@ celery.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
-    worker_prefetch_multiplier=1,  # Pull one task at a time for even distribution
+    worker_prefetch_multiplier=1,
     task_routes={
         'celery_scan_window': {'queue': 'github_scan'},
         'dispatch_window': {'queue': 'window_dispatch'},
@@ -54,17 +52,29 @@ celery.conf.update(
 )
 # --- End Celery Setup ---
 
-# --- Global Connection Pool ---
+# --- Global Variables for DB Pool and Event Loop ---
 global_pool = None
+worker_loop = None
 
 @worker_process_init.connect
 def init_worker(**kwargs):
-    global global_pool
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    global_pool = loop.run_until_complete(asyncpg.create_pool(dsn=DB_DSN))
-    loop.run_until_complete(setup_db(global_pool))
+    global global_pool, worker_loop
+    # Create and set a new event loop for this worker process
+    worker_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(worker_loop)
+    # Optionally, configure pool parameters (like max inactive lifetime)
+    global_pool = worker_loop.run_until_complete(
+        asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=10, max_inactive_connection_lifetime=300)
+    )
+    worker_loop.run_until_complete(setup_db(global_pool))
     logger.info("Worker process initialized and connection pool created.")
+
+@worker_process_shutdown.connect
+def shutdown_worker(**kwargs):
+    global global_pool, worker_loop
+    if global_pool:
+        worker_loop.run_until_complete(global_pool.close())
+        logger.info("Connection pool closed.")
 
 # --- Flask App ---
 def create_flask_app():
@@ -136,7 +146,8 @@ class GitHubLimitExceeded(Exception):
     pass
 
 # --- Rate Limiter ---
-github_limiter = AsyncLimiter(10, 60) # 10 requests per minute
+github_limiter = AsyncLimiter(10, 60)  # 10 requests per minute
+# --- End Rate Limiter ---
 
 # --- HTTP Helpers ---
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
@@ -183,8 +194,6 @@ async def fetch_file_content(url):
 
 # --- Recursive Scan Function ---
 async def scan_window(pattern_name, window_start, window_end):
-    """Scan a time window for the given pattern, paginating through results.
-       If GitHubLimitExceeded is raised, subdivide the window and aggregate."""
     total = 0
     for page in range(1, MAX_PAGES + 1):
         query = f"{PATTERN_SEARCH_TERMS[pattern_name]} pushed:{window_start.isoformat()}..{window_end.isoformat()}"
@@ -192,7 +201,6 @@ async def scan_window(pattern_name, window_start, window_end):
         try:
             data = await fetch_github(url)
         except GitHubLimitExceeded as gle:
-            # Subdivide the window if possible.
             duration = window_end - window_start
             if duration >= timedelta(minutes=MIN_WINDOW_MINUTES * 2):
                 mid = window_start + duration / 2
@@ -201,11 +209,11 @@ async def scan_window(pattern_name, window_start, window_end):
                 right = await scan_window(pattern_name, mid, window_end)
                 return left + right
             else:
-                logger.warning(f"Window too small to subdivide further for {pattern_name}: {window_start.isoformat()} to {window_end.isoformat()}")
+                logger.warning(f"Window too small to subdivide for {pattern_name}: {window_start.isoformat()} to {window_end.isoformat()}")
                 return 0
         items = data.get("items", [])
         if not items:
-            break  # no more results for this page
+            break
         tasks = [process_item(item, global_pool) for item in items]
         counts = await asyncio.gather(*tasks, return_exceptions=True)
         total += sum(count for count in counts if not isinstance(count, Exception))
@@ -217,8 +225,8 @@ def celery_scan_window(pattern_name, window_start_str, window_end_str):
     window_start = datetime.fromisoformat(window_start_str)
     window_end = datetime.fromisoformat(window_end_str)
     try:
-        loop = asyncio.get_event_loop()
-        result = loop.run_until_complete(scan_window(pattern_name, window_start, window_end))
+        # Use the dedicated worker_loop from initialization
+        result = worker_loop.run_until_complete(scan_window(pattern_name, window_start, window_end))
         return result
     except Exception as e:
         raise Exception(f"celery_scan_window failed for pattern {pattern_name} window {window_start_str} to {window_end_str}: {str(e)}")
@@ -274,7 +282,6 @@ def dispatch_window(_, pattern_name, window_start_str, window_end_str, now_str):
     if window_end < now:
         next_start = window_end
         next_end = min(next_start + timedelta(minutes=WINDOW_MINUTES), now)
-        # Schedule the next window for this pattern.
         tasks = [celery_scan_window.s(pattern_name, next_start.isoformat(), next_end.isoformat())]
         chord(tasks)(dispatch_window.s(pattern_name, next_start.isoformat(), next_end.isoformat(), now_str))
     else:
@@ -282,7 +289,7 @@ def dispatch_window(_, pattern_name, window_start_str, window_end_str, now_str):
 
 @celery.task(name="dispatch_all_scans", queue="dispatcher")
 def dispatch_all_scans():
-    now = datetime.now(datetime.timezone.utc)
+    now = datetime.now(timezone.utc)
     now_str = now.isoformat()
     for pattern_name in PATTERN_SEARCH_TERMS.keys():
         start_time = now - timedelta(days=DEFAULT_DAYS)
