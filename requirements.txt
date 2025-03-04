@@ -1,6 +1,7 @@
 requests
 psycopg2
 flask
+aiolimiter
 redis>=3.5.3
 celery[redis]
 tenacity

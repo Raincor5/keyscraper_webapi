@@ -9,6 +9,7 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 from celery import Celery, chord
 from celery.signals import worker_process_init
 from flask import Flask
+from aiolimiter import AsyncLimiter
 
 # --- Configuration Management ---
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
@@ -44,6 +45,12 @@ celery.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
+    worker_prefetch_multiplier=1,  # Pull one task at a time for even distribution
+    task_routes={
+        'celery_scan_window': {'queue': 'github_scan'},
+        'dispatch_window': {'queue': 'window_dispatch'},
+        'dispatch_all_scans': {'queue': 'dispatcher'},
+    },
 )
 # --- End Celery Setup ---
 
@@ -66,6 +73,7 @@ def create_flask_app():
     def index():
         dispatch_all_scans.delay()
         return "Dispatched scan tasks. Check logs for output.\n"
+    app.add_url_rule("/", "index", index)
     return app
 
 flask_app = create_flask_app()
@@ -127,27 +135,37 @@ async def update_last_scanned(pool, timestamp):
 class GitHubLimitExceeded(Exception):
     pass
 
+# --- Rate Limiter ---
+github_limiter = AsyncLimiter(10, 60) # 10 requests per minute
+
 # --- HTTP Helpers ---
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 async def fetch_github(url):
     headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, timeout=HTTP_TIMEOUT) as response:
-            if response.status == 422:
-                text = await response.text()
-                if "Cannot access beyond the first 1000 results" in text:
-                    logger.warning("GitHub API error 422: Cannot access beyond the first 1000 results.")
-                    raise GitHubLimitExceeded(text)
-                else:
+    async with github_limiter:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=HTTP_TIMEOUT) as response:
+                if response.status == 422:
+                    text = await response.text()
+                    if "Cannot access beyond the first 1000 results" in text:
+                        logger.warning("GitHub API error 422: Cannot access beyond the first 1000 results.")
+                        raise GitHubLimitExceeded(text)
+                    else:
+                        raise Exception(f"GitHub API error {response.status}: {text}")
+                if response.status == 403:
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        sleep_time = int(retry_after)
+                    else:
+                        reset_time = response.headers.get("X-RateLimit-Reset")
+                        sleep_time = max(int(reset_time) - int(datetime.utcnow().timestamp()), 60) if reset_time else 60
+                    logger.warning(f"Rate limited by GitHub, sleeping for {sleep_time} seconds...")
+                    await asyncio.sleep(sleep_time)
+                    raise Exception("Rate limited")
+                if response.status != 200:
+                    text = await response.text()
                     raise Exception(f"GitHub API error {response.status}: {text}")
-            if response.status == 403:
-                logger.warning("Rate limited by GitHub, sleeping for 60 seconds...")
-                await asyncio.sleep(60)
-                raise Exception("Rate limited")
-            if response.status != 200:
-                text = await response.text()
-                raise Exception(f"GitHub API error {response.status}: {text}")
-            return await response.json()
+                return await response.json()
 
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 async def fetch_file_content(url):
@@ -194,12 +212,13 @@ async def scan_window(pattern_name, window_start, window_end):
     return total
 
 # --- Celery Task for a Single Window ---
-@celery.task(name="celery_scan_window")
+@celery.task(name="celery_scan_window", queue="github_scan")
 def celery_scan_window(pattern_name, window_start_str, window_end_str):
     window_start = datetime.fromisoformat(window_start_str)
     window_end = datetime.fromisoformat(window_end_str)
     try:
-        result = asyncio.run(scan_window(pattern_name, window_start, window_end))
+        loop = asyncio.get_event_loop()
+        result = loop.run_until_complete(scan_window(pattern_name, window_start, window_end))
         return result
     except Exception as e:
         raise Exception(f"celery_scan_window failed for pattern {pattern_name} window {window_start_str} to {window_end_str}: {str(e)}")
@@ -247,12 +266,8 @@ async def process_item(item, pool):
 # --- End File Processing ---
 
 # --- Dispatching Tasks in Batches (Window Chain) ---
-@celery.task(name="dispatch_window")
+@celery.task(name="dispatch_window", queue="window_dispatch")
 def dispatch_window(_, pattern_name, window_start_str, window_end_str, now_str):
-    """
-    Callback for a window batch.
-    If the current window_end is before 'now', schedule the next window.
-    """
     window_end = datetime.fromisoformat(window_end_str)
     now = datetime.fromisoformat(now_str)
     logger.info(f"Completed window for {pattern_name}: {window_start_str} to {window_end_str}")
@@ -265,9 +280,9 @@ def dispatch_window(_, pattern_name, window_start_str, window_end_str, now_str):
     else:
         logger.info(f"All windows complete for pattern: {pattern_name}")
 
-@celery.task(name="dispatch_all_scans")
+@celery.task(name="dispatch_all_scans", queue="dispatcher")
 def dispatch_all_scans():
-    now = datetime.utcnow()
+    now = datetime.now(datetime.timezone.utc)
     now_str = now.isoformat()
     for pattern_name in PATTERN_SEARCH_TERMS.keys():
         start_time = now - timedelta(days=DEFAULT_DAYS)
