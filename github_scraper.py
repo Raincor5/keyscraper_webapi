@@ -200,6 +200,37 @@ async def fetch_file_content(url):
 
 # --- Worker Stage 1: Scanning and Finding Matches ---
 # Instead of processing items to immediately write to DB, we extract match info.
+
+def simple_match(content, prefix, expected_length, valid_chars):
+    """
+    Scan the content for substrings starting with `prefix` that are `expected_length` long,
+    and validate that all characters after the prefix are in valid_chars.
+    """
+    matches = []
+    start = 0
+    while True:
+        index = content.find(prefix, start)
+        if index == -1:
+            break
+        candidate = content[index:index + expected_length]
+        # Check if we have a full-length candidate.
+        if len(candidate) == expected_length:
+            # Validate characters after the prefix.
+            if all(c in valid_chars for c in candidate[len(prefix):]):
+                matches.append(candidate)
+        start = index + 1
+    return matches
+
+
+# Define matching parameters for each key type.
+# (prefix, expected_length, allowed characters for the part after the prefix)
+MATCHING_PARAMS = {
+    "AWS": ("AKIA", 20, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+    "GitHub Token": ("ghp_", 40, "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+    "Google API": ("AIza", 39, "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_"),
+    # Adjust these as needed for other types.
+}
+
 async def find_matches(item):
     repo_url = item["repository"]["html_url"]
     file_path = item["path"]
@@ -214,22 +245,25 @@ async def find_matches(item):
     except Exception as e:
         logger.error(f"Error fetching file {file_url}: {e}")
         return []
+    
     matches_found = []
-    for key_type, compiled in COMPILED_PATTERNS.items():
-        for match in compiled.findall(content):
-            # Log a partial version (first 20 characters) of the match.
-            partial = match if len(match) <= 20 else match[:20] + "..."
+    # Loop over each key type's parameters.
+    for key_type, (prefix, expected_length, valid_chars) in MATCHING_PARAMS.items():
+        found = simple_match(content, prefix, expected_length, valid_chars)
+        for candidate in found:
+            partial = candidate if len(candidate) <= 20 else candidate[:20] + "..."
             logger.info(f"Found {key_type} match in {repo_url}/{file_path}: {partial}")
             matches_found.append({
                 "repo_url": repo_url,
                 "file_path": file_path,
                 "key_type": key_type,
-                "leaked_key": match,
+                "leaked_key": candidate,
                 "detected_at": datetime.now(timezone.utc).isoformat()
             })
     if not matches_found:
         logger.info(f"No keys found in {file_url}")
     return matches_found
+
 
 # Modified scan_window returns a list of match dictionaries.
 async def scan_window(pattern_name, window_start, window_end):
