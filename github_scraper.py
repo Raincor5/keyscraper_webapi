@@ -217,6 +217,9 @@ async def find_matches(item):
     matches_found = []
     for key_type, compiled in COMPILED_PATTERNS.items():
         for match in compiled.findall(content):
+            # Log a partial version (first 20 characters) of the match.
+            partial = match if len(match) <= 20 else match[:20] + "..."
+            logger.info(f"Found {key_type} match in {repo_url}/{file_path}: {partial}")
             matches_found.append({
                 "repo_url": repo_url,
                 "file_path": file_path,
